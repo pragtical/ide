@@ -1,165 +1,167 @@
-# lite-xl IDE
+# Pragtical IDE
 
-![lite-xl IDE with Debugger Open](https://raw.githubusercontent.com/lite-xl/lite-xl-ide/main/screenshots/debugger.png)
+A collection of build and debugger plugins for
+[Pragtical](https://github.com/pragtical/pragtical), with metapackages for common
+language toolchains. LSP and Git support come from the maintained
+[Pragtical LSP](https://github.com/pragtical/lsp) and
+[SCM](https://github.com/pragtical/scm) plugins.
 
-[`lite-xl`](https://github.com/lite-xl/lite-xl) is a light-weight extensible text editor.
+![Pragtical with the debugger open](screenshots/debugger.png)
 
-`lite-xl-ide` aims to be a suite of plugins for `lite-xl` that can turn it into a high-performance C/C++ IDE with minimal fuss.
+This fork targets the current Pragtical development runtime, including core
+floating views, application menus, horizontal toolbars and `core.json`. Older
+runtimes without those APIs are unsupported. The build and debugger plugins
+remain experimental.
 
-Please note, `lite-xl-ide` is still **experimental**; it is not ready for release. Use at your own risk.
+## Installation
 
-## Quickstart
+Using [ppm](https://github.com/pragtical/plugin-manager):
 
-To install, you can use [`lpm`](https://github.com/lite-xl/lite-xl-plugin-manager):
-
-```bash
-lpm add https://github.com/lite-xl/lite-xl-ide.git && lpm install ide --no-install-optional
+```sh
+ppm add https://github.com/pragtical/ide.git:master
+ppm install ide --no-install-optional
 ```
 
-If you want to just try it out, you can always use `run` to try it in a new lite bottle:
+Install `ide_c` for C/C++ tools, including the build plugin, debugger and language
+server configuration. Other language metapackages are listed below. Build and debugger can also be
+installed separately.
 
-```bash
-lpm run https://github.com/lite-xl/lite-xl-ide.git:main ide --no-install-optional
-```
+| Language | Metapackage |
+| --- | --- |
+| Bash | `ide_bash` |
+| C/C++ | `ide_c` |
+| Clojure | `ide_clojure` |
+| CSS/LESS/SCSS | `ide_css` |
+| D | `ide_d` |
+| Go | `ide_go` |
+| Haxe | `ide_haxe` |
+| HTML | `ide_html` |
+| Java | `ide_java` |
+| JavaScript | `ide_javascript` |
+| JSON | `ide_json` |
+| Lua | `ide_lua` |
+| PHP | `ide_php` |
+| Python | `ide_python` |
+| Rust | `ide_rust` |
+| TeX | `ide_tex` |
+| TypeScript | `ide_typescript` |
+| YAML | `ide_yaml` |
+| Zig | `ide_zig` |
+| Web development (HTML/CSS/JS/TS/JSON and Emmet) | `ide_web` |
 
-Alternatively, if you don't have `lpm`, or don't want it, you can always pull the repository manually with `git`
-and simply copy the entire set of plugins into lite's plugin directory.
+For a manual installation, copy `plugins/build`, `plugins/debugger` and optionally
+`plugins/ide.lua` into your Pragtical user plugin directory. On Linux this is
+usually `~/.config/pragtical/plugins`. The empty `ide.lua` module is a metapackage
+entry; language servers and other dependencies must be installed separately.
 
-```bash
-git clone https://github.com/lite-xl/lite-xl-ide.git && cp -R lite-xl-ide/plugins/* ~/.config/lite-xl-/plugins
-```
+## Build
 
-By default, `ide` should try and figure out what your build system is and activate the appropriate build system module.
-However, in many cases, the build system cannot infer your build targets, so you'll want to manually set them up,
-as specified below in the [build targets](#build-targets) section.
-
-## Plugins
-
-### Build
-
-The build plugin is a flexible build system. It can be configured to either use `make`, or, it can take over entirely
-and run all the compile commands directly.
-
-* Support for `make`, `cmake`, `meson`, a shell command, or the default internal build system.
-* Support for internal building if configured with an appropriate compiler frontend. (`gcc` or `clang`).
-* Support for executing binary in an external terminal.
-
-#### Build Targets
-
-To explicitly use a specific build system with a set of build targets, you should place the configuration for these modules in your
-[lite-xl project module](https://lite-xl.com/user-guide/configuration/#project-module), which can be opened with `Core: Open Project Module`.
-
-When adding build targets, they broadly look like this:
+The build plugin supports Make, CMake, Meson, Gradle wrappers, shell scripts and
+an internal GCC/Clang build backend. It discovers targets from the current
+project, or uses targets configured in its
+[project module](https://pragtical.dev/docs/user-guide/configuration/#project-module).
+Open that module with `core:open-project-module`.
 
 ```lua
+local config = require "core.config"
 config.plugins.build.targets = {
-	{ name = "debug", binary = "bin/debug-binary" },
-	{ name = "release", binary = "bin/release-binary" }
+  { name = "debug", backend = "make", binary = "bin/app-debug" },
+  { name = "release", backend = "make", binary = "bin/app-release" }
 }
 ```
 
-This will set up two build targets, which can be toggled between with `ctrl+t`.
+A target's `backend` selects its build system. Setting
+`config.plugins.build.type = "make"` selects one backend for every target instead.
+For the internal backend, the target's own `type` describes its output:
+`"executable"`, `"static"` or `"shared"`.
 
-Each build system will allow for different arguments, but the two most important are `name` and `binary` (if applicable).
-
-##### make
-
-To explicitly use a makefile with a set of build targets, you should put the following in your lite-xl project module. 
-
-```lua
-config.plugins.build.targets = {
-	{ name = "debug", binary = "bin/debug-binary" },
-	{ name = "release", binary = "bin/release-binary" }
-}
-config.plugins.build.type = "make"
-```
-
-##### cmake
-
-To explicitly use a CMakeLists file, with a set of build targets, you should put the following in your lite-xl project module.
+For CMake and Meson, `name` identifies the configuration, `buildtype` chooses its
+build type, `build_directory` optionally chooses an output directory, and
+`build_target` optionally selects one build-system target. CMake uses build types
+such as `Debug` and `Release`; Meson uses `debug` and `release`.
 
 ```lua
 config.plugins.build.targets = {
-	{ name = "debug", buildtype = "debug", binary = "bin/debug-binary" },
-	{ name = "release", buildtype = "release", binary = "bin/release-binary" }
+  { name = "debug", backend = "cmake", buildtype = "Debug",
+    build_directory = "build-debug", binary = "build-debug/app" }
 }
-config.plugins.build.type = "cmake"
 ```
 
-##### meson
+CMake targets need an explicit `binary` to run or debug. Meson can discover the
+first executable built by default; an explicit `binary` takes precedence.
+Cleaning keeps configured CMake/Meson build directories intact.
 
-To explicitly use a meson.build file, with a set of build targets, you should put the following in your lite-xl project module.
+The internal backend accepts `src` or `srcs`, `obj`, `cc`, `cxx`, `ar`, `ld`,
+`cflags`, `cxxflags`, `ldflags`, `ignored_files` and per-file options in `files`.
+It compiles `.c`, `.cc`, `.cpp` and `.cxx` files, tracks header dependencies and
+links C++ sources with the C++ compiler. Flags can be strings or argument arrays.
 
 ```lua
 config.plugins.build.targets = {
-	{ name = "debug", buildtype = "debug", binary = "bin/debug-binary" },
-	{ name = "release", buildtype = "release", binary = "bin/release-binary" }
+  { name = "debug", backend = "internal", type = "executable",
+    srcs = { "src" }, binary = "bin/app", cflags = { "-g", "-O0" },
+    cxxflags = { "-g", "-O0" } }
 }
-config.plugins.build.type = "meson"
 ```
 
-##### internal
+Shell targets accept `runner`, `command`, `arguments` and optional `args_clean`.
+Gradle uses `gradlew` on Unix and `gradlew.bat` on Windows; its target name is the
+wrapper task. Set `task = "executable"` for a runnable Gradle task.
 
-The internal build system allows you to set a source directory, compiler flags, a compiler, a linker, etc.. for a C/C++ project.
+Programs run asynchronously with captured output by default. Set
+`config.plugins.build.terminal` to an external terminal's command prefix when
+interactive input is needed, for example `{ "xterm", "-e" }`. Program arguments
+support quotes and escaped spaces. A target can provide `binary_arguments` as a
+default argument array; explicit argument history overrides it. Bare executable
+names are resolved through PATH. The build output pane includes scrollbars
+and clickable GCC/Clang/MSVC diagnostics, and its toolbar works with all
+TreeView docking positions.
+
+The Tools → Build menu lists available commands and their current bindings.
+Defaults include Ctrl+B to build, Ctrl+Shift+B to clean, Ctrl+E to run,
+Ctrl+Shift+E to enter program arguments, Ctrl+T to cycle targets,
+Ctrl+Shift+T to select a target and F6 to toggle output. Ctrl+Shift+Alt+E selects
+and runs a target without replacing the LSP completion binding.
+
+See [the build API](plugins/build/README.md) to add a backend.
+
+## Debugger
+
+The default backend uses GDB's machine interface. Install GDB on your PATH, or
+set `config.plugins.debugger.gdb_path` to its executable. Compile the program
+with debug symbols and select its build target or set `config.target_binary`.
+
+The debugger supports source breakpoints, stepping, stack selection, watch
+expressions, and symbol evaluation in an owned floating popup. Watch inputs are
+protected from document saving. The Tools → Debugger menu exposes its commands.
+
+Defaults include F8 to start/continue or pause, Shift+F8 to terminate, F7 to step
+over, Shift+F7 to step into, Ctrl+F7 to step out, F9 to toggle a source breakpoint
+and F12 to toggle the debugger drawer. A left click in a document's gutter also
+toggles a breakpoint.
+
+To use GDB's Debug Adapter Protocol backend:
 
 ```lua
-config.plugins.build.targets = {
-	{ name = "debug", binary = "bin/debug-binary", type = "executable", src = "src" },
-	{ name = "release", binary = "bin/release-binary", type = "executable", src = "src" }
-}
-config.plugins.build.type = "internal"
+config.plugins.debugger.backend = "dap"
+-- Optional custom adapter command:
+-- config.plugins.debugger.dap_command = { "/path/to/gdb", "--interpreter=dap" }
 ```
 
-* `type`: is your type of build; valid values are `executable`, `static` or `shared`.
-* `ignored_files`: will ignore any file that matches the pattern based on the normal ignore syntax.
-* `files`: will take specific files and add them to the compile with override options based on any of these other options
-* `cflags`: will specify compile time flags.
-* `ldflags`: will specify link time flags
-* `cc`: will specify your c compiler
-* `cxx`: will specify your c++ compiler
-* `ar`: specifies your archiver
-* `ld`: specifies your linker
+This requires GDB built with DAP support. Adapter integrations other than GDB
+have not been verified. GDB's usual platform requirements, including macOS
+codesigning for debugging, still apply.
 
-##### shell
+The optional [terminal plugin](https://github.com/pragtical/terminal) provides a
+program output pane and attachment to GDB running inside a terminal. Start GDB
+with `--interpreter=mi3 --args`, then use `debugger:attach`. Attachment is supported
+by the MI backend; `debugger:detach` terminates the attached session. Native
+terminal methods are left intact.
 
-The shell build system lets you specify a custom command, which will run upon building.
+## Verification
 
-```lua
-config.plugins.build.targets = {
-	{ name = "debug", binary = "bin/debug-binary", command = "make", arguments = { "debug" } },
-	{ name = "release", binary = "bin/release-binary", command = "make", arguments = { "release" } }
-}
-config.plugins.build.type = "shell"
-```
-
-
-### Debugger
-
-The debugger plugin acts as a front-end to `gdb`.
-
-* Allows placing of breakpoints by clicking in the gutter.
-* Allows all normal debugging control operations: step, step over, step up, continue, break, quit.
-* Allows watching variables by hovering over the appropriate symbol during debugging.
-* Allows traversing the callstack when stopped.
-* Allow to run debugged program with shell-like argument list.
-* Allows watching variables by adding them to a watchlist.
-* Allow clicking on the debugger status to change it (running -> break, inactive -> start, stopped -> continue).
-* Allows binding the debugger plugin to `terminal`, allowing it to automatically parse and emit input to the debugger in a particular terminal.
-
-#### TODO
-
-* Allows adding hovered watched to watchlist with right click context menu.
-
-### LSP
-
-Full support for LSP through @jgmdev's [wonderful plugin](https://github.com/lite-xl/lite-xl-lsp), included in this manifest.
-
-#### TODO
-
-* Bundle a statically compiled ccls with LSP, and configure it through the ide plugin.
-
-### Git
-
-Full support for git, again through @jgmdev's [VCS plugin](https://github.com/lite-xl/lite-xl-plugins).
-
-* Bundle a statically compiled git for vcs.
+The migration was checked against the current Pragtical runtime on Linux,
+including all six build backends, live GDB MI/DAP sessions, and rendered build,
+watch and floating-hover views. The Gradle check exercises wrapper dispatch with
+a fixture script rather than a Java Gradle installation. Windows/macOS compiler
+and debugger execution remains to be verified.

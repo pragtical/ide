@@ -1,309 +1,318 @@
-
 local core = require "core"
-local common = require "core.common"
-local style  = require "core.style"
-local config  = require "core.config"
+local config = require "core.config"
+local json = require "core.json"
 
-local gdb = {
-  running_program = nil,
-  command_queue = { },
-  breakpoints = { },
-  debugger_stopped = nil,
-  debugger_completed = nil
-}
+---@class plugins.debugger.gdb
+local gdb = { command_queue = {}, breakpoints = {}, sequence = 0 }
 
-local function chomp(str)
-  return str:gsub("[\n\r]+$", "")
-end
-
-local function gdb_parse_string(str)
-  local offset = 0
-  while offset ~= nil do
-    offset = str:find('"', offset+1)
-    if offset and str:sub(offset - 1, offset - 1) ~= "\\" then
-      return str:sub(1, offset - 1):gsub("\\\"", "\""), offset + 1
-    end
-  end
-end
-
-local gdb_parse_status_attributes
-local gdb_parse_status_array
-
-local function gdb_parse_status_value(value)
-  if value:sub(1, 1) == "{" then
-    return gdb_parse_status_attributes(value:sub(2))
-  elseif value:sub(1,1) == "[" then
-    return gdb_parse_status_array(value:sub(2))
-  elseif value:sub(1,1) == "\"" then
-    return gdb_parse_string(value:sub(2))
-  end
-  return nil
-end
-
-gdb_parse_status_array = function(values)
-  local array = { }
-  local offset = 1
-  if values:sub(offset, offset) == "]" then
-    return array
-  end
-  while true do
-    local value, length = gdb_parse_status_value(values:sub(offset))
-    table.insert(array, value)
-    offset = offset + length
-    if values:sub(offset, offset) == "," then
-      offset = offset + 1
-    elseif values:sub(offset, offset) == "]" then
-      return array, offset+1
-    end
-  end
-end
-
-
-gdb_parse_status_attributes = function(attributes)
-  local obj = { }
-  local offset = 1
-  while true do
-    local equal_idx = attributes:find("=", offset)
-    local attr_name = attributes:sub(offset, equal_idx-1)
-    local attr_value, length = gdb_parse_status_value(attributes:sub(equal_idx+1))
-    if not length then
-      return obj, offset + 1
-    end
-    obj[attr_name] = attr_value
-    offset = length + equal_idx + 1
-    if attributes:sub(offset, offset) == "," then
-      offset = offset + 1
-    else
-      return obj, offset+1
-    end
-  end
-  return offset
-end
-
-local function gdb_parse_status_line(line)
-  line = chomp(line)
-  local idx = line:find(",")
-  local type = line:sub(1, 1)
-  if idx and (type == "*" or type == "=") then
-    return type, line:sub(2, idx - 1), gdb_parse_status_attributes(line:sub(idx+1))
-  elseif type == "~" then
-    return type, gdb_parse_string(line:sub(3))
-  elseif type == "&" then
-    return type, gdb_parse_string(line:sub(3))
-  elseif type == "^" then
-    local quote = line:find('"')
-    if idx and (not quote or idx < quote) then
-      return type, line:sub(2, idx - 1), gdb_parse_status_attributes(line:sub(idx+1))
-    else
-      return type, line:sub(2)
-    end
-  else
-    return type
-  end
-end
-
-function gdb:cmd(command, on_finish)
-  table.insert(self.command_queue, { command, on_finish })
-  if self.running_thread and core.threads[self.running_thread] then
-    coroutine.resume(core.threads[self.running_thread].cr)
-  end
-end
-
-function gdb:should_engage(path) return true end
-function gdb:step_into(on_done)  self:cmd("step", on_done) end
-function gdb:step_over(on_done)  self:cmd("next", on_done) end
-function gdb:step_out(on_done)   self:cmd("finish", on_done) end
-function gdb:continue(on_done)   self:cmd("cont", on_done) self.stack = nil end
-function gdb:halt(on_done)       self.running_program:interrupt() end
-function gdb:terminate(on_done)  self.running_program:terminate() end
-function gdb:frame(idx, on_done)   self:cmd("f " .. idx, on_done) end
-function gdb:skip_file(file, on_done) self:cmd("skip -gfi " .. file, on_done) end
-
-
-function gdb:add_breakpoint(path, line, on_done)
-  self:cmd("b " .. path .. ":" .. line, function(type, category, attributes)
-    if attributes["bkpt"] then
-      self.breakpoints[path .. ":" .. line] = tonumber(attributes["bkpt"]["number"])
-      if on_done then on_done() end
-    end
-  end)
-end
-
-function gdb:remove_breakpoint(path, line, on_done)
-  if self.breakpoints[path .. ":" .. line] then self:cmd("d " .. self.breakpoints[path .. ":" .. line], function()
-    if on_done then on_done() end
-  end) end
-  self.breakpoints[path .. ":" .. line] = nil
-end
-
-
-function gdb:print(expr, on_finish)
-  self:cmd("p " .. expr, function(t, category, result)
-    if result and type(result) == "table" then
-      local equals = result[1] and result[1]:find("=")
-      if equals then
-        on_finish(result[1]:sub(equals+1))
-      else
-        on_finish(result[1])
-      end
-    else
-        on_finish(result)
-    end
-  end)
-end
-
-function gdb:variable(variable, on_finish)
-  self:print(variable, function(result)
-    on_finish(result and result:gsub("\\n$", ""))
-  end)
-end
-
-function gdb:stacktrace(on_finish)
-  self:cmd("backtrace", function(type, category, frames)
-    local stack = { }
-    for i,v in ipairs(frames) do
-      local str = string.gsub(v, "[%xx]+ in ", "")
-      local s,e = str:find(" at ")
-      if not s then
-        s,e = str:find(" from ")
-      end
-      if s then
-        local _, _, n, func, args = string.find(str:sub(1, s-1), "#(%d+)%s+(%S+) (.+)")
-        local _, _, file, line = string.find(str:sub(e + 1), "([^:]+):?(%d*)")
-        table.insert(stack, { func, args, file:gsub("\\n", ""), line and tonumber(line) })
-      end
-    end
-    on_finish(stack)
-  end)
-end
-
-function gdb:instruction(on_finish)
-  if self.stack_frame then
-    on_finish(table.unpack(self.stack_frame))
-  end
-end
-
-
-function gdb:loop()
-  local out = self.running_program and self.running_program:read_stderr()
-  if out and out ~= "" then 
-    self.saved_stderr = self.saved_stderr .. out
-    while true do
-      local s,e = self.saved_stderr:find("\n")
-      if not s then break end
-      self.debugger_out(self.saved_stderr:sub(1, s - 1), "stderr")
-      self.saved_stderr = self.saved_stderr:sub(e + 1)
-    end
-  end
-  local result = self.running_program and self.running_program:read_stdout()
-  if result == nil then return false end
-  if #result > 0 then
-    self.saved_result = self.saved_result .. result
-    if config.plugins.debugger.debug then io.open("debugger.out", "ab"):write(result):close() end
-    while #self.saved_result > 0 do
-      local newline = self.saved_result:find("\n")
-      if not newline then break end
-      local line = self.saved_result:sub(1, newline-1)
-      local type, category, attributes = gdb_parse_status_line(line)
-      self.saved_result = self.saved_result:sub(newline + 1)
-      if type == "*" then
-        if category == "stopped" then
-          if attributes.reason == "exited-normally" or attributes.reason == "exited" then
-            self.debugger_completed()
-            self:cmd("quit")
-          elseif attributes.frame and attributes.bkptno == "1" then
-            self.debugger_started()
-            self:continue()
-          elseif attributes.reason == "end-stepping-range" and attributes.frame and attributes.frame.file and attributes.frame.line then
-            self.stack_frame = {
-              attributes.frame.file,
-              tonumber(attributes.frame.line),
-              attributes.frame.func
-            }
-            self.debugger_stopped()
-          else
-            if attributes.frame and attributes.frame.file and attributes.frame.line then
-              self.stack_frame = {
-                attributes.frame.file,
-                tonumber(attributes.frame.line),
-                attributes.frame.func
-              }
-            end
-            self.debugger_stopped()
-            self.accumulator = {}
+---Parse a machine-interface record, including nested lists and C string escapes.
+---@param line string Complete output line
+---@return table? record Token, kind, class, payload or stream text
+function gdb.parse_record(line)
+  local token, kind, body = line:match("^(%d*)([%^%*=%+~@&])(.*)$")
+  if not kind then return nil end
+  local index = 1
+  local parse_value, parse_fields
+  local function parse_string()
+    assert(body:sub(index, index) == '"', "Expected a quoted MI string")
+    index = index + 1
+    local text = {}
+    local escapes = { n = "\n", r = "\r", t = "\t", b = "\b", f = "\f", v = "\v", a = "\7" }
+    while index <= #body do
+      local char = body:sub(index, index)
+      index = index + 1
+      if char == '"' then return table.concat(text) end
+      if char == "\\" then
+        char = body:sub(index, index)
+        index = index + 1
+        if char:match("[0-7]") then
+          local digits = char
+          for _ = 1, 2 do
+            local next_char = body:sub(index, index)
+            if not next_char:match("[0-7]") then break end
+            digits, index = digits .. next_char, index + 1
           end
+          char = string.char(tonumber(digits, 8))
+        else
+          char = escapes[char] or char
         end
-      elseif type == "^" then
-        if (category == "done" or category == "error") and self.waiting_on_result then
-          self.waiting_on_result(type, category, category == "error" and attributes["msg"] or self.accumulator)
-          self.waiting_on_result = nil
-          self.accumulator = {}
-        end
-      elseif type == "~" then
-        table.insert(self.accumulator, category)
-      elseif type == "=" and self.waiting_on_result then
-        self.waiting_on_result(type, category, attributes)
-        self.waiting_on_result = nil
-      elseif type == "=" then
-      elseif type == "&" then
+      end
+      text[#text + 1] = char
+    end
+    error("Unclosed MI string")
+  end
+  parse_fields = function(closing, array)
+    local result = {}
+    while index <= #body and body:sub(index, index) ~= closing do
+      local name = body:match("^([%w_%-]+)=", index)
+      if name then
+        index = index + #name + 1
+        local value = parse_value()
+        if array then result[#result + 1] = { [name] = value } else result[name] = value end
       else
-        if not line:find("^%(gdb%)") then
-          self.debugger_out(line, "stdout")
+        result[#result + 1] = parse_value()
+      end
+      if body:sub(index, index) ~= "," then break end
+      index = index + 1
+    end
+    if closing then
+      assert(body:sub(index, index) == closing, "Unclosed MI container")
+      index = index + 1
+    end
+    return result
+  end
+  parse_value = function()
+    local char = body:sub(index, index)
+    if char == '"' then return parse_string() end
+    if char == "{" or char == "[" then
+      index = index + 1
+      return parse_fields(char == "{" and "}" or "]", char == "[")
+    end
+    error("Invalid MI value at " .. index)
+  end
+  if kind == "~" or kind == "@" or kind == "&" then
+    return { kind = kind, text = parse_string() }
+  end
+  local category = body:match("^([^,]+)")
+  index = #category + 2
+  return { token = tonumber(token), kind = kind, class = category, payload = parse_fields() }
+end
+
+---Queue an MI command; the editor scheduler resumes the process loop.
+---@param command string Machine-interface command without a token
+---@param callback fun(kind:string,category:string,payload:table)? Result callback
+function gdb:cmd(command, callback)
+  self.sequence = self.sequence + 1
+  self.command_queue[#self.command_queue + 1] = { id = self.sequence, command = command, callback = callback }
+end
+
+---Select GDB by default for native executable debugging.
+---@param path string Executable path
+---@return boolean supported Always true
+function gdb:should_engage(path) return true end
+
+---Step into the next source statement.
+---@param callback function? Completion callback
+function gdb:step_into(callback) self:cmd("-exec-step", callback) end
+---Step over the next source statement.
+---@param callback function? Completion callback
+function gdb:step_over(callback) self:cmd("-exec-next", callback) end
+---Run until the current function returns.
+---@param callback function? Completion callback
+function gdb:step_out(callback) self:cmd("-exec-finish", callback) end
+---Resume the inferior process.
+---@param callback function? Completion callback
+function gdb:continue(callback) self:cmd("-exec-continue", callback) end
+---Interrupt the inferior without signaling the editor or terminal process.
+---@param callback function? Completion callback
+function gdb:halt(callback) self:cmd("-exec-interrupt --all", callback) end
+---End the session and terminate an owned GDB process.
+function gdb:terminate()
+  self.completed = true
+  if self.running_program then self.running_program:terminate() end
+end
+---Select a zero-based stack frame.
+---@param index integer Stack frame level
+---@param callback function? Completion callback
+function gdb:frame(index, callback) self:cmd("-stack-select-frame " .. tostring(index), callback) end
+---Skip a configured source-file glob while stepping.
+---@param file string File glob
+---@param callback function? Completion callback
+function gdb:skip_file(file, callback)
+  self:cmd("-interpreter-exec console " .. json.encode("skip -gfi " .. file), callback)
+end
+
+---Install a breakpoint and retain GDB's ID for later removal.
+---@param path string Source filename
+---@param line integer Source line
+---@param callback function? Completion callback
+function gdb:add_breakpoint(path, line, callback)
+  self:cmd("-break-insert " .. json.encode(path .. ":" .. line), function(kind, category, payload)
+    if payload.bkpt then self.breakpoints[path .. ":" .. line] = payload.bkpt.number end
+    if callback then callback(kind, category, payload) end
+  end)
+end
+
+---Remove a previously installed breakpoint.
+---@param path string Source filename
+---@param line integer Source line
+---@param callback function? Completion callback
+function gdb:remove_breakpoint(path, line, callback)
+  local key = path .. ":" .. line
+  local id = self.breakpoints[key]
+  self.breakpoints[key] = nil
+  if id then self:cmd("-break-delete " .. id, callback) elseif callback then callback() end
+end
+
+---Evaluate a debugger expression in the selected frame.
+---@param expression string Expression to evaluate
+---@param callback fun(value:string?) Evaluation result
+function gdb:variable(expression, callback)
+  self:cmd("-data-evaluate-expression " .. json.encode(expression), function(_, category, payload)
+    callback(category == "done" and payload.value or nil)
+  end)
+end
+
+gdb.print = gdb.variable
+
+---Retrieve structured stack frames with absolute source paths when available.
+---@param callback fun(frames:table[]) Stack frame callback
+function gdb:stacktrace(callback)
+  self:cmd("-stack-list-frames", function(_, _, payload)
+    local stack = {}
+    for _, entry in ipairs(payload.stack or {}) do
+      local frame = entry.frame or entry
+      stack[#stack + 1] = { frame.func or "?", "", frame.fullname or frame.file, tonumber(frame.line) }
+    end
+    callback(stack)
+  end)
+end
+
+---Return the most recently stopped source location.
+---@param callback function Source location callback
+function gdb:instruction(callback)
+  if self.stack_frame then callback(table.unpack(self.stack_frame)) end
+end
+
+---Complete a session once, including early process-start failures.
+function gdb:finish()
+  if self.completed then return end
+  self.completed = true
+  if self.debugger_completed then self.debugger_completed() end
+end
+
+---Drain complete MI records and write queued commands without losing partial I/O.
+---@return boolean running Whether the process loop should continue
+function gdb:loop()
+  if self.completed then return false end
+  local proc = self.running_program
+  if not proc then return false end
+  if proc.read_stderr then
+    local err = proc:read_stderr()
+    if err and err ~= "" and self.debugger_out then self.debugger_out(err, "stderr") end
+  end
+  local chunk = proc:read_stdout()
+  self.saved_result = self.saved_result .. (chunk or "")
+  while true do
+    local newline = self.saved_result:find("\n", 1, true)
+    if not newline then break end
+    local line = self.saved_result:sub(1, newline - 1):gsub("\r$", "")
+    self.saved_result = self.saved_result:sub(newline + 1)
+    local ok, record = pcall(self.parse_record, line)
+    if not ok then
+      core.error("Invalid GDB response: %s", record)
+    elseif record then
+      if record.kind == "^" then
+        local pending = self.pending
+        if pending and record.token == pending.id then
+          self.pending = nil
+          if record.class == "error" then core.error("GDB: %s", record.payload.msg or "Command failed") end
+          if pending.callback then pending.callback(record.kind, record.class, record.payload) end
+          if self.completed then return false end
         end
+      elseif record.kind == "*" and record.class == "stopped" then
+        local data = record.payload
+        if data.reason and data.reason:find("^exited") then
+          self:finish()
+          proc:terminate()
+          return false
+        end
+        local frame = data.frame
+        self.stack_frame = frame and { frame.fullname or frame.file, tonumber(frame.line), frame.func } or nil
+        if not self.started then
+          self.started = true
+          self.debugger_started()
+          self:continue()
+        elseif self.debugger_stopped then self.debugger_stopped() end
+      elseif (record.kind == "~" or record.kind == "@" or record.kind == "&") and self.debugger_out then
+        self.debugger_out(record.text, record.kind == "&" and "stderr" or "stdout")
       end
+    elseif line ~= "" and not line:find("^%(gdb%)") and self.debugger_out then
+      self.debugger_out(line, "stdout")
     end
   end
-  if not self.waiting_on_result and #self.command_queue > 0 then
-    self.accumulator = {}
-    if self.running_program:write(self.command_queue[1][1] .. "\n") then
-      if self.command_queue[1][2] then
-        self.waiting_on_result = self.command_queue[1][2]
-      end
-      table.remove(self.command_queue, 1)
+  if not self.pending and #self.command_queue > 0 then
+    self.pending = table.remove(self.command_queue, 1)
+    self.pending.wire = self.pending.id .. self.pending.command .. "\n"
+  end
+  if self.pending and self.pending.wire ~= "" then
+    local written, err = proc:write(self.pending.wire)
+    if written then self.pending.wire = self.pending.wire:sub(written + 1)
+    elseif err ~= process.ERROR_WOULDBLOCK then
+      core.error("Unable to write to GDB: %s", tostring(err))
+      self:finish()
+      proc:terminate()
+      return false
     end
   end
-  coroutine.yield(config.plugins.debugger.interval)
+  if chunk == nil and proc.running and not proc:running() then self:finish(); return false end
   return true
 end
 
-local build = require "plugins.build"
-local function start(gdb, program_or_terminal, arguments, started, stopped, completed, out)
-  gdb.debugger_started = started
-  gdb.debugger_stopped = stopped
-  gdb.debugger_completed = completed
-  gdb.debugger_out = out
-  gdb.running_thread = core.add_thread(function()
-    if type(program_or_terminal) == "string" then
-      local args = { "gdb", "-q", "-nx", "--interpreter=mi3", "--args", core.root_project():absolute_path(program_or_terminal), table.unpack(arguments) }
-      core.log_quiet("Running " .. table.concat(args, " "))
-      gdb.running_program = process.start(args, { cwd = core.root_project().path })
-      gdb.waiting_on_result = function(type, category, attributes)
-        gdb:cmd("set filename-display absolute")
-        gdb:cmd("start")
-      end
+---Start GDB and stop at its entrypoint before applying persistent breakpoints.
+---@param program string Executable filename
+---@param arguments string[]? Program arguments
+---@param started function Initial-stop callback
+---@param stopped function Later-stop callback
+---@param completed function Session completion callback
+---@param out function? Output callback
+function gdb:start(program, arguments, started, stopped, completed, out)
+  self.session = (self.session or 0) + 1
+  local session = self.session
+  self.command_queue, self.breakpoints, self.sequence = {}, {}, 0
+  self.saved_result, self.pending, self.completed, self.started = "", nil, false, false
+  self.stack_frame = nil
+  self.debugger_started, self.debugger_stopped, self.debugger_completed, self.debugger_out = started, stopped, completed, out
+  self.running_thread = core.add_thread(function()
+    if self.session ~= session or self.completed then return end
+    local settings = config.plugins.debugger
+    local args = { settings.gdb_path or "gdb", "-q", "-nx", "--interpreter=mi3", "--args",
+      core.root_project():absolute_path(program) }
+    for _, argument in ipairs(arguments or {}) do args[#args + 1] = tostring(argument) end
+    local err
+    self.running_program, err = process.start(args, {
+      cwd = core.root_project().path, background = PLATFORM == "Windows"
+    })
+    if not self.running_program then
+      core.error("Unable to start GDB: %s", tostring(err))
+      self:finish()
     else
-      gdb.running_program = program_or_terminal
-      gdb:cmd("set filename-display absolute")
-      gdb:cmd("start")
+      self:cmd("-gdb-set mi-async on")
+      self:cmd("-gdb-set breakpoint pending on")
+      self:cmd("-gdb-set filename-display absolute")
+      local function launch_result(_, category)
+        if category == "error" then self.running_program:terminate(); self:finish() end
+      end
+      self:cmd("-break-insert -t " .. (settings.entrypoint or "main"), launch_result)
+      self:cmd("-exec-run", launch_result)
+      while self.session == session and self:loop() do coroutine.yield(settings.interval or 0.01) end
     end
-    gdb.saved_result = ""
-    gdb.saved_stderr = ""
-    gdb.accumulator = {}
-    while gdb:loop() do end
-    local status = gdb.running_program:returncode()
-    core.log_quiet("Debugger finished.")
-    gdb.running_program = nil
-    gdb.running_thread = nil
+    if self.session == session then self.running_program, self.running_thread = nil, nil end
   end)
 end
 
-function gdb:start(program, arguments, started, stopped, completed, out)
-  return start(self, program, arguments, started, stopped, completed, out)
-end
-
-
+---Attach the model to an existing terminal exposing the process stream interface.
+---@param terminal table Process-like terminal adapter
+---@param started function Initial-stop callback
+---@param stopped function Later-stop callback
+---@param completed function Completion callback
+---@param out function? Output callback
 function gdb:attach(terminal, started, stopped, completed, out)
-  start(self, terminal, nil, started, stopped, completed, out)
+  self.session = (self.session or 0) + 1
+  local session = self.session
+  self.command_queue, self.breakpoints, self.sequence = {}, {}, 0
+  self.saved_result, self.pending, self.completed, self.started = "", nil, false, false
+  self.stack_frame = nil
+  self.debugger_started, self.debugger_stopped, self.debugger_completed, self.debugger_out = started, stopped, completed, out
+  self.running_program = terminal
+  self:cmd("-gdb-set mi-async on")
+  self:cmd("-break-insert -t main")
+  self:cmd("-exec-run")
+  self.running_thread = core.add_thread(function()
+    if self.session ~= session or self.completed then return end
+    while self.session == session and self:loop() do coroutine.yield(config.plugins.debugger.interval or 0.01) end
+    if self.session == session then self.running_program, self.running_thread = nil, nil end
+  end)
 end
 
 return gdb

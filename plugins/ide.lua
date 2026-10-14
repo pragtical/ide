@@ -1,8 +1,4 @@
--- mod-version:3
+-- mod-version:3.12.3
 
--- Configuration plugin for ide.
--- Configures lsp to use ccls, or clangd.
-
-local ide = {}
-
-return ide
+-- Metapackage entry point; dependencies are declared in manifest.json.
+return {}

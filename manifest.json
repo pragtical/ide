@@ -1,151 +1,300 @@
 {
-  "addons": [{
-    "id": "build",
-    "version": "0.3",
-    "mod_version": "3",
-    "description": "Provides a build system, messages window, and easily clickable errors. Supports an internal build system, and `make`. *([screenshot](https://raw.githubusercontent.com/lite-xl/lite-xl-ide/main/screenshots/build.png))*",
-    "path": "plugins/build",
-    "dependencies": {
-      "json": {}
+  "addons": [
+    {
+      "id": "build",
+      "version": "0.3.1",
+      "mod_version": "3.12.3",
+      "description": "Build targets, compiler diagnostics and program output. Supports Make, CMake, Meson, Gradle, shell scripts and an internal C/C++ backend. *([screenshot](https://raw.githubusercontent.com/pragtical/ide/master/screenshots/build.png))*",
+      "path": "plugins/build",
+      "dependencies": {}
+    },
+    {
+      "id": "debugger",
+      "version": "0.3.1",
+      "mod_version": "3.12.3",
+      "description": "Debugger integration with GDB MI and DAP backends, source breakpoints, stack navigation and watch expressions. *([screenshot](https://raw.githubusercontent.com/pragtical/ide/master/screenshots/debugger.png))*",
+      "path": "plugins/debugger",
+      "dependencies": {
+        "build": {},
+        "terminal": {
+          "optional": true
+        }
+      }
+    },
+    {
+      "id": "ide",
+      "version": "0.3.1",
+      "description": "A metapackage that provides the minimum functionalities for Pragtical to run as a minimal IDE.",
+      "mod_version": "3.12.3",
+      "path": "plugins/ide.lua",
+      "dependencies": {
+        "meta_colors": {},
+        "meta_languages": {},
+        "align_carets": {
+          "optional": true
+        },
+        "autoinsert": {},
+        "autosave": {},
+        "bracketmatch": {},
+        "colorpreview": {},
+        "extend_selection_line": {},
+        "indentguide": {},
+        "lfautoinsert": {},
+        "lintplus": {},
+        "lsp": {},
+        "lsp_snippets": {},
+        "minimap": {},
+        "opacity": {
+          "optional": true
+        },
+        "rainbowparen": {
+          "optional": true
+        },
+        "scalestatus": {
+          "optional": true
+        },
+        "selectionhighlight": {},
+        "snippets": {},
+        "sticky_scroll": {
+          "optional": true
+        },
+        "todotreeview": {
+          "optional": true
+        },
+        "scm": {},
+        "terminal": {}
+      }
+    },
+    {
+      "id": "ide_c",
+      "version": "0.1.1",
+      "mod_version": "3.12.3",
+      "description": "A metapackage that turns Pragtical into an IDE for C/C++.",
+      "path": "plugins/ide.lua",
+      "dependencies": {
+        "ide": {},
+        "build": {},
+        "debugger": {},
+        "lsp_c": {}
+      }
+    },
+    {
+      "id": "ide_java",
+      "version": "0.1.1",
+      "mod_version": "3.12.3",
+      "description": "A metapackage that turns Pragtical into an IDE for Java.",
+      "path": "plugins/ide.lua",
+      "dependencies": {
+        "ide": {},
+        "lsp_java": {}
+      }
+    },
+    {
+      "id": "ide_javascript",
+      "version": "0.1.1",
+      "mod_version": "3.12.3",
+      "description": "A metapackage that turns Pragtical into an IDE for Javascript.",
+      "path": "plugins/ide.lua",
+      "dependencies": {
+        "ide": {},
+        "lsp_typescript": {},
+        "lsp_quicklintjs": {}
+      }
+    },
+    {
+      "id": "ide_lua",
+      "version": "0.1.1",
+      "mod_version": "3.12.3",
+      "description": "A metapackage that turns Pragtical into an IDE for Lua.",
+      "path": "plugins/ide.lua",
+      "dependencies": {
+        "ide": {},
+        "lsp_lua": {}
+      }
+    },
+    {
+      "id": "ide_python",
+      "version": "0.1.1",
+      "mod_version": "3.12.3",
+      "description": "A metapackage that turns Pragtical into an IDE for Python.",
+      "path": "plugins/ide.lua",
+      "dependencies": {
+        "ide": {},
+        "lsp_python": {}
+      }
+    },
+    {
+      "id": "ide_rust",
+      "version": "0.1.1",
+      "mod_version": "3.12.3",
+      "description": "A metapackage that turns Pragtical into an IDE for Rust.",
+      "path": "plugins/ide.lua",
+      "dependencies": {
+        "ide": {},
+        "lsp_rust": {}
+      }
+    },
+    {
+      "id": "ide_tex",
+      "version": "0.1.1",
+      "mod_version": "3.12.3",
+      "description": "A metapackage that turns Pragtical into an IDE for TeX.",
+      "path": "plugins/ide.lua",
+      "dependencies": {
+        "ide": {},
+        "lsp_tex": {}
+      }
+    },
+    {
+      "id": "ide_typescript",
+      "version": "0.1.1",
+      "mod_version": "3.12.3",
+      "description": "A metapackage that turns Pragtical into an IDE for Typescript.",
+      "path": "plugins/ide.lua",
+      "dependencies": {
+        "ide": {},
+        "lsp_typescript": {}
+      }
+    },
+    {
+      "id": "ide_zig",
+      "version": "0.1.1",
+      "mod_version": "3.12.3",
+      "description": "A metapackage that turns Pragtical into an IDE for Zig.",
+      "path": "plugins/ide.lua",
+      "dependencies": {
+        "ide": {},
+        "lsp_zig": {}
+      }
+    },
+    {
+      "id": "ide_bash",
+      "version": "0.1.0",
+      "mod_version": "3.12.3",
+      "description": "A metapackage providing Pragtical language tools for Bash.",
+      "path": "plugins/ide.lua",
+      "dependencies": {
+        "ide": {},
+        "lsp_bash": {}
+      }
+    },
+    {
+      "id": "ide_clojure",
+      "version": "0.1.0",
+      "mod_version": "3.12.3",
+      "description": "A metapackage providing Pragtical language tools for Clojure.",
+      "path": "plugins/ide.lua",
+      "dependencies": {
+        "ide": {},
+        "lsp_clojure": {}
+      }
+    },
+    {
+      "id": "ide_css",
+      "version": "0.1.0",
+      "mod_version": "3.12.3",
+      "description": "A metapackage providing Pragtical language tools for CSS, LESS and SCSS.",
+      "path": "plugins/ide.lua",
+      "dependencies": {
+        "ide": {},
+        "lsp_css": {}
+      }
+    },
+    {
+      "id": "ide_d",
+      "version": "0.1.0",
+      "mod_version": "3.12.3",
+      "description": "A metapackage providing Pragtical language tools for D.",
+      "path": "plugins/ide.lua",
+      "dependencies": {
+        "ide": {},
+        "lsp_d": {}
+      }
+    },
+    {
+      "id": "ide_go",
+      "version": "0.1.0",
+      "mod_version": "3.12.3",
+      "description": "A metapackage providing Pragtical language tools for Go.",
+      "path": "plugins/ide.lua",
+      "dependencies": {
+        "ide": {},
+        "lsp_go": {}
+      }
+    },
+    {
+      "id": "ide_haxe",
+      "version": "0.1.0",
+      "mod_version": "3.12.3",
+      "description": "A metapackage providing Pragtical language tools for Haxe.",
+      "path": "plugins/ide.lua",
+      "dependencies": {
+        "ide": {},
+        "lsp_haxe": {}
+      }
+    },
+    {
+      "id": "ide_html",
+      "version": "0.1.0",
+      "mod_version": "3.12.3",
+      "description": "A metapackage providing Pragtical language tools for HTML.",
+      "path": "plugins/ide.lua",
+      "dependencies": {
+        "ide": {},
+        "lsp_html": {}
+      }
+    },
+    {
+      "id": "ide_json",
+      "version": "0.1.0",
+      "mod_version": "3.12.3",
+      "description": "A metapackage providing Pragtical language tools for JSON.",
+      "path": "plugins/ide.lua",
+      "dependencies": {
+        "ide": {},
+        "lsp_json": {}
+      }
+    },
+    {
+      "id": "ide_php",
+      "version": "0.1.0",
+      "mod_version": "3.12.3",
+      "description": "A metapackage providing Pragtical language tools for PHP.",
+      "path": "plugins/ide.lua",
+      "dependencies": {
+        "ide": {},
+        "lsp_php": {}
+      }
+    },
+    {
+      "id": "ide_yaml",
+      "version": "0.1.0",
+      "mod_version": "3.12.3",
+      "description": "A metapackage providing Pragtical language tools for YAML.",
+      "path": "plugins/ide.lua",
+      "dependencies": {
+        "ide": {},
+        "lsp_yaml": {}
+      }
+    },
+    {
+      "id": "ide_web",
+      "version": "0.1.0",
+      "mod_version": "3.12.3",
+      "description": "A metapackage providing Pragtical language tools for web development with HTML, CSS, JavaScript, TypeScript, JSON and Emmet.",
+      "path": "plugins/ide.lua",
+      "dependencies": {
+        "ide": {},
+        "lsp_html": {},
+        "lsp_css": {},
+        "lsp_typescript": {},
+        "lsp_quicklintjs": {},
+        "lsp_json": {},
+        "lsp_emmet": {}
+      }
     }
-  }, {
-    "id": "debugger",
-    "version": "0.3",
-    "mod_version": "3",
-    "description": "Provides a debugger integration, with pluggable backends. Currently supports only gdb. *([screenshot](https://raw.githubusercontent.com/lite-xl/lite-xl-ide/main/screenshots/debugger.png))*",
-    "path": "plugins/debugger",
-    "dependencies": {
-      "build": {},
-      "json": {}
-    }
-  }, {
-    "id": "ide",
-    "version": "0.3",
-    "description": "A metapackage that provides the minimum functionalities for Lite XL to run as a minimal IDE.",
-    "mod_version": "3",
-    "path": "plugins/ide.lua",
-    "dependencies": {
-      "meta_colors": {},
-      "meta_languages": {},
-      "align_carets": { "optional": true },
-      "autoinsert": {},
-      "autosave": {},
-      "bracketmatch": {},
-      "colorpreview": {},
-      "extend_selection_line": {},
-      "indentguide": {},
-      "lfautoinsert": {},
-      "lintplus": {},
-      "lsp": {},
-      "lsp_snippets": {},
-      "minimap": {},
-      "opacity": { "optional": true },
-      "rainbowparen": { "optional": true },
-      "scalestatus": { "optional": true },
-      "selectionhighlight": {},
-      "snippets": {},
-      "sticky_scroll": { "optional": true },
-      "todotreeview": { "optional": true },
-      "scm": {},
-      "gitblame": { "optional": true },
-      "terminal": {},
-      "persist": { "optional": true }
-    }
-  }, {
-    "id": "ide_c",
-    "version": "0.1",
-    "mod_version": "3",
-    "description": "A metapackage that turns Lite XL into an IDE for C/C++.",
-    "path": "plugins/ide.lua",
-    "dependencies": {
-      "ide": {},
-      "build": {},
-      "debugger": {},
-      "lsp_c": {}
-    }
-  }, {
-    "id": "ide_java",
-    "version": "0.1",
-    "mod_version": "3",
-    "description": "A metapackage that turns Lite XL into an IDE for Java.",
-    "path": "plugins/ide.lua",
-    "dependencies": {
-      "ide": {},
-      "lsp_java": {}
-    }
-  }, {
-    "id": "ide_javascript",
-    "version": "0.1",
-    "mod_version": "3",
-    "description": "A metapackage that turns Lite XL into an IDE for Javascript.",
-    "path": "plugins/ide.lua",
-    "dependencies": {
-      "ide": {},
-      "lsp_typescript": {},
-      "lsp_quicklintjs": {}
-    }
-  }, {
-    "id": "ide_lua",
-    "version": "0.1",
-    "mod_version": "3",
-    "description": "A metapackage that turns Lite XL into an IDE for Lua.",
-    "path": "plugins/ide.lua",
-    "dependencies": {
-      "ide": {},
-      "lsp_lua": {}
-    }
-  }, {
-    "id": "ide_python",
-    "version": "0.1",
-    "mod_version": "3",
-    "description": "A metapackage that turns Lite XL into an IDE for Python.",
-    "path": "plugins/ide.lua",
-    "dependencies": {
-      "ide": {},
-      "lsp_python": {}
-    }
-  }, {
-    "id": "ide_rust",
-    "version": "0.1",
-    "mod_version": "3",
-    "description": "A metapackage that turns Lite XL into an IDE for Rust.",
-    "path": "plugins/ide.lua",
-    "dependencies": {
-      "ide": {},
-      "lsp_rust": {}
-    }
-  }, {
-    "id": "ide_tex",
-    "version": "0.1",
-    "mod_version": "3",
-    "description": "A metapackage that turns Lite XL into an IDE for TeX.",
-    "path": "plugins/ide.lua",
-    "dependencies": {
-      "ide": {},
-      "lsp_tex": {}
-    }
-  }, {
-    "id": "ide_typescript",
-    "version": "0.1",
-    "mod_version": "3",
-    "description": "A metapackage that turns Lite XL into an IDE for Typescript.",
-    "path": "plugins/ide.lua",
-    "dependencies": {
-      "ide": {},
-      "lsp_typescript": {}
-    }
-  }, {
-    "id": "ide_zig",
-    "version": "0.1",
-    "mod_version": "3",
-    "description": "A metapackage that turns Lite XL into an IDE for Zig.",
-    "path": "plugins/ide.lua",
-    "dependencies": {
-      "ide": {},
-      "lsp_zig": {}
-    }
-  }],
+  ],
   "remotes": [
-    "https://github.com/adamharrison/lite-xl-lsp-servers:3.0"
+    "https://github.com/pragtical/lsp-servers:latest"
   ]
 }

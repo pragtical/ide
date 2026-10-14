@@ -1,101 +1,78 @@
 local core = require "core"
 local common = require "core.common"
-local build = require "plugins.build"
 local config = require "core.config"
-local json = require "libraries.json"
+local json = require "core.json"
+local build = require "plugins.build"
+local util = require "plugins.build.util"
 
-local meson = {
-  -- ninja executes from inside a build folder, so all file references begin with `..`, and should be removed to reference the file.
-  error_pattern = "^%s*%.%./([^:]+):(%d+):(%d*):? %[?(%w*)%]?:? (.+)",
-  file_pattern = "^%s*%.%./([^:]+):(%d+):(%d*):? (.+)",
-}
+local meson = {}
 
-local function grep(t, cond) local nt = {} for i,v in ipairs(t) do if cond(v, i) then table.insert(nt, v) end end return nt end
-
-local function get_build_directory(target)
-  return target.build_directory or core.root_project().path .. PATHSEP .. (target.build_directory or ("build-" .. target.name:lower():gsub("%W+", "-"):gsub("%-+", "-"):gsub("^%-", ""):gsub("%-$", "")))
-end
-
+---Infer standard configurations for a Meson project.
+---@return table[]? targets Debug and release targets when meson.build exists
 function meson.infer()
-  return system.get_file_info(core.root_project().path .. PATHSEP .. "meson.build") and {
-    { name = "debug" },
-    { name = "release", buildtype = "release" }
-  }
+  if system.get_file_info(core.root_project():absolute_path("meson.build")) then
+    return { { name = "debug", buildtype = "debug" }, { name = "release", buildtype = "release" } }
+  end
 end
 
+---Normalize Ninja's parent-relative compiler paths before parsing a diagnostic.
+---@param line string Compiler output line
+---@return string|table message Output line or parsed diagnostic
 function meson.parse_compile_line(line)
-  local _, _, file, line_number, column, type, message = line:find(meson.error_pattern)
-  if file and (type == "warning" or type == "error") then
-    return { type, file, line_number, column, message }
-  end
-  local _, _, file, line_number, column, message = line:find(meson.file_pattern)
-  return file and { "info", file, line_number, (column or 1), message } or line
+  return build.parse_compile_line((line:gsub("^(%s*)%.%.[/\\]", "%1")))
 end
 
-local function run_command(args)
-  local proc = process.start(args)
-  local accumulator = ""
-  while true do
-    local chunk = proc:read_stdout(4096)
-    if not chunk or (chunk == "" and not proc:running()) then break end
-    accumulator = accumulator .. chunk
-    coroutine.yield()
-  end
-  local status = proc:returncode()
-  if status ~= 0 then error(proc:read_stderr(4096)) end
-  return accumulator
-end
-
+---Configure, discover the default executable, and build through Meson's backend.
+---@param target table Build target
+---@param callback fun(status:integer)? Completion callback
 function meson.build(target, callback)
-  local bd = get_build_directory(target)
-  local tasks = { }
-
-  local ninja_build = function()
-    build.run_tasks({ { "ninja", "-C", bd } }, function(status)
-      local filtered_messages = grep(build.message_view.messages, function(v) return type(v) == 'table' and v[1] == "error" end)
-      if callback then callback(status == 0 and #filtered_messages or 1) end
-    end, function(line)
-      build.message_view:add_message(meson.parse_compile_line(line))
-    end)
+  local directory = util.build_directory(target)
+  local function compile()
+    local args = { "meson", "compile", "-C", directory, "-j", tostring(build.threads) }
+    if target.build_target then args[#args + 1] = target.build_target end
+    build.run_tasks({ args }, function(status)
+      if callback then callback(util.build_status(build, status)) end
+    end, function(line) build.message_view:add_message(meson.parse_compile_line(line)) end)
   end
-
-  local check_executables = function()
-    local info = json.decode(run_command({ "meson", "introspect", bd, "-a" }))
-    -- find an executable that is built by default
-    for i,v in ipairs(info.targets) do
-      if v.build_by_default and v.type == "executable" and v.filename then
-        target.binary = v.filename[1]
-        config.target_binary = target.binary
-        target.wd = common.dirname(target.binary)
+  local function discover()
+    if target.checked or target.binary then target.checked = true; compile(); return end
+    local output = {}
+    build.run_tasks({ { "meson", "introspect", directory, "--targets" } }, function(status)
+      if status ~= 0 then if callback then callback(status) end; return end
+      local targets, err = json.decode(table.concat(output, "\n"))
+      if type(targets) ~= "table" then
+        build.message_view:add_message({ "error", err or "Invalid Meson introspection output" })
+        if callback then callback(1) end
+        return
       end
-    end
-    target.checked = true
+      for _, executable in ipairs(targets) do
+        if executable.build_by_default and executable.type == "executable" and executable.filename then
+          target.binary = executable.filename[1]
+          target.wd = target.wd or common.dirname(target.binary)
+          if build.targets[build.state.target] == target then config.target_binary = target.binary end
+          break
+        end
+      end
+      target.checked = true
+      compile()
+    end, function(line) output[#output + 1] = line end)
   end
-
-  if not system.get_file_info(bd) then
-    build.run_tasks({ { "meson", "setup", bd, "--buildtype", target.buildtype or "debug" } }, function(status)
-      core.add_thread(function()
-        check_executables()
-        ninja_build()
-      end)
-    end)
+  if system.get_file_info(directory .. PATHSEP .. "meson-private" .. PATHSEP .. "coredata.dat") then
+    discover()
   else
-    if not target.checked then
-      core.add_thread(function()
-        check_executables()
-        ninja_build()
-      end)
-    else
-      ninja_build()
-    end
+    build.run_tasks({ { "meson", "setup", directory, core.root_project().path,
+      "--buildtype", target.buildtype or "debug" } }, function(status)
+      if status ~= 0 then if callback then callback(status) end; return end
+      discover()
+    end)
   end
 end
 
-
+---Clean generated targets while retaining configuration and user-owned files.
+---@param target table Build target
+---@param callback fun(status:integer)? Completion callback
 function meson.clean(target, callback)
-  if system.get_file_info(get_build_directory(target)) then common.rm(get_build_directory(target), true) end
-  callback(0)
+  build.run_tasks({ { "meson", "compile", "-C", util.build_directory(target), "--clean" } }, callback)
 end
-
 
 return meson

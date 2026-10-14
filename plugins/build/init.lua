@@ -1,4 +1,4 @@
--- mod-version:3
+-- mod-version:3.12.3
 local core = require "core"
 local command = require "core.command"
 local keymap = require "core.keymap"
@@ -8,40 +8,9 @@ local style = require "core.style"
 local View = require "core.view"
 local DocView = require "core.docview"
 local StatusView = require "core.statusview"
-local TreeView = config.plugins.treeview ~= false and require "plugins.treeview"
 local ToolbarView = require "plugins.toolbarview"
-
-
-local storage 
-if rawget(_G, "MOD_VERSION_MAJOR") == 4 then
-  storage = require "core.storage"
-else
-  storage = {}
-  function storage.load(module, key)
-    local f = io.open(USERDIR .. PATHSEP .. module .. "-" .. key .. ".state", "rb")
-    return f and load("return " .. f:read("*all"))()
-  end
-  function storage.save(module, key, value)
-    io.open(USERDIR .. PATHSEP .. module .. "-".. key .. ".state", "wb"):write(common.serialize(value)):close()
-  end
-  if not core.root_project then
-    local root_project = {
-      path = core.project_dir,
-      absolute_path = function(self, path)
-        return core.project_absolute_path(path)
-      end,
-      normalize_path = function(self, path)
-        return common.normalize_path(path)
-      end,
-      get_file_info = function(self, path)
-        return system.get_file_info(path)
-      end
-    }
-    function core.root_project()
-      return root_project
-    end
-  end
-end
+local storage = require "core.storage"
+local plugin_directory = common.dirname(debug.getinfo(1, "S").source:sub(2))
 
 local build = common.merge({
   targets = { },
@@ -56,66 +25,97 @@ local build = common.merge({
   cflags = os.getenv("CFLAGS") or {},
   cxxflags = os.getenv("CXXFLAGS") or {},
   ldflags = os.getenv("LDFLAGS") or {},
-  error_pattern = "^%s*([^:]+):(%d+):(%d*):? %[?(%w*)%]?:? (.+)",
-  file_pattern = "^%s*([^:]+):(%d+):(%d*):? (.+)",
+  error_pattern = "^%s*(.-):(%d+):(%d*):?%s*([%a ]-):%s*(.+)",
+  file_pattern = "^%s*(.-):(%d+):(%d*):?%s*(.+)",
   error_color = style.error,
   warning_color = style.warn,
   good_color = style.good,
   drawer_size = 100,
   max_previous_arguments = 100,
   on_success = "minimize",
-  terminal = (PLATFORM == "Windows" and { os.getenv("COMSPEC") } or { "xterm", "-T", function(target) return target.name end, "-e" }),
-  shell = (PLATFORM == "Windows" and "START /B" or { "bash", "-c" })
+  terminal = false,
+  shell = (PLATFORM == "Windows" and { os.getenv("COMSPEC") or "cmd.exe", "/d", "/s", "/c" } or { "sh", "-c" })
 }, config.plugins.build)
 
 
 if not style.build then style.build = {} end
 style.build.font = style.code_font:copy(style.code_font:get_height()*0.7)
 
-function build.argument_string_to_table(str)
-  if not str then return nil end
-  local s = str:find("%S")
-  if not s then return nil end
-  local t = {}
-  local quote_open = nil
-  while true do
-    if quote_open then
-      local a = str:find(quote_open, s)
-      if not a then error("can't find closing quote in " .. str .. " from " .. s) end
-      table.insert(t, str:sub(s, a-1))
-      s = a + 1
-      quote_open = nil
-    else
-      local e = str:find("[\"' ]", s)
-      if not e then break end
-      local sample = str:sub(e, e)
-      if sample == '"' or sample == "'" then
-        if s < e then table.insert(t, str:sub(s, e - 1)) end
-        s = e + 1
-        quote_open = sample
-      else
-        local ne = select(2, str:find("^%s*", e))
-        if e > s then table.insert(t, str:sub(s,e - 1)) end
-        s = ne + 1
+local executable_cache = {}
+
+---Resolve a project executable or a command available through PATH.
+---@param binary string? Program filename or command name
+---@return string? filename Absolute executable path, if found
+function build.get_binary(binary)
+  if not binary or binary == "" then return nil end
+  local project_path = core.root_project():absolute_path(binary)
+  local info = system.get_file_info(project_path)
+  if info and info.type == "file" then return project_path end
+  if binary:find("[/\\]") or common.is_absolute_path(binary) then return nil end
+  local path = os.getenv("PATH") or ""
+  local extensions = PLATFORM == "Windows" and (os.getenv("PATHEXT") or ".COM;.EXE;.BAT;.CMD") or ""
+  local cached = executable_cache[binary]
+  if cached and cached.path == path and cached.extensions == extensions
+    and system.get_time() - cached.time < 1 then return cached.filename end
+  local suffixes = { "" }
+  if PLATFORM == "Windows" and not binary:match("%.[^%.]+$") then
+    for extension in extensions:gmatch("[^;]+") do suffixes[#suffixes + 1] = extension end
+  end
+  for directory in path:gmatch(PLATFORM == "Windows" and "[^;]+" or "[^:]+") do
+    directory = directory:gsub('^"(.*)"$', "%1")
+    for _, suffix in ipairs(suffixes) do
+      local filename = directory .. PATHSEP .. binary .. suffix
+      info = system.get_file_info(filename)
+      if info and info.type == "file" then
+        executable_cache[binary] = { path = path, extensions = extensions, time = system.get_time(), filename = filename }
+        return filename
       end
     end
   end
-  if s < #str then table.insert(t, str:sub(s)) end
-  return t
+  executable_cache[binary] = { path = path, extensions = extensions, time = system.get_time() }
 end
 
-local function get_plugin_directory()
-  local paths = {
-    USERDIR .. PATHSEP .. "plugins" .. PATHSEP .. "build",
-    DATADIR .. PATHSEP .. "plugins" .. PATHSEP .. "build"
-  }
-  for i, v in ipairs(paths) do if system.get_file_info(v) then return v end end
-  return nil
+---Split shell-style arguments, preserving quoted spaces, empty values and escapes.
+---@param str string? Argument text
+---@return string[] arguments Parsed arguments
+function build.argument_string_to_table(str)
+  if not str or str == "" then return {} end
+  local result, buffer, quote, started = {}, {}, nil, false
+  local i = 1
+  while i <= #str do
+    local char = str:sub(i, i)
+    if quote then
+      if char == quote then
+        quote = nil
+      elseif char == "\\" and quote == '"' and str:sub(i + 1, i + 1):match('["\\]') then
+        i = i + 1
+        buffer[#buffer + 1] = str:sub(i, i)
+      else
+        buffer[#buffer + 1] = char
+      end
+    elseif char == '"' or char == "'" then
+      quote, started = char, true
+    elseif char:match("%s") then
+      if started then result[#result + 1] = table.concat(buffer); buffer, started = {}, false end
+    elseif char == "\\" and str:sub(i + 1, i + 1):match("[%s\\'\"]") then
+      i = i + 1
+      buffer[#buffer + 1], started = str:sub(i, i), true
+    else
+      buffer[#buffer + 1], started = char, true
+    end
+    i = i + 1
+  end
+  assert(not quote, "Unclosed quote in arguments")
+  if started then result[#result + 1] = table.concat(buffer) end
+  return result
 end
 
+---Load available build backends, or return one by name.
+---@param specific string? Backend name
+---@return table|table[] backends Selected backend or all backends
 function build.get_backends(specific)
   local backends = {}
-  for _, backend in ipairs(system.list_dir(get_plugin_directory() .. PATHSEP .. "backends")) do
+  for _, backend in ipairs(system.list_dir(plugin_directory .. PATHSEP .. "backends")) do
     if backend:find("%.lua$") then
       local module = require("plugins.build.backends." .. backend:gsub("%.lua", ""))
       table.insert(backends, module)
@@ -131,20 +131,13 @@ function build.get_backends(specific)
   return backends
 end
 
-local function split(splitter, str)
-  local o = 1
-  local res = {}
-  while true do
-      local s, e = str:find(splitter, o)
-      table.insert(res, str:sub(o, s and (s - 1) or #str))
-      if not s then break end
-      o = e + 1
-  end
-  return res
+build.state = storage.load("build", "state") or {}
+build.state.previous_arguments = build.state.previous_arguments or {}
+build.state.target = tonumber(build.state.target) or 1
+for _, field in ipairs { "cflags", "cxxflags", "ldflags" } do
+  if type(build[field]) == "string" then build[field] = build.argument_string_to_table(build[field]) end
 end
 
-
-build.state = storage.load("build", "state") or { previous_arguments = {}, target = 1 }
 local function save_state()
   storage.save("build", "state", build.state)
 end
@@ -158,7 +151,7 @@ local function jump_to_file(file, line, col)
         local view = core.root_view:open_doc(core.open_doc(file))
         if line then
           view:scroll_to_line(math.max(1, line - 20), true)
-          view:set_selection(line, col or 1, line, col or 1)
+          view.doc:set_selection(line, col or 1, line, col or 1)
         end
         break
       end
@@ -167,116 +160,125 @@ local function jump_to_file(file, line, col)
 end
 
 
+---Parse GCC/Clang and MSVC diagnostics, including Windows drive-letter paths.
+---@param line string One complete compiler output line
+---@return string|table message Plain output or severity/file/line/column/text fields
 function build.parse_compile_line(line)
-  local stripped_line = line:gsub("\x1B%[%d+;?%d+m",""):gsub("\x1B%[[Km]", "")
-  local _, _, file, line_number, column, type, message = stripped_line:find(build.error_pattern)
-  if file and (type == "warning" or type == "error") then
-    return { type, file, line_number, column, message }
+  local stripped = line:gsub("\27%[[%d;]*%a", "")
+  local file, number, column, severity, message = stripped:match(build.error_pattern)
+  if not file then
+    file, number, column, severity, message = stripped:match("^%s*(.-)%((%d+),?(%d*)%):%s*(%a+)%s*[^:]*:%s*(.+)")
   end
-  local _, _, file, line_number, column, message = line:find(build.file_pattern)
-  return file and { "info", core.root_project():normalize_path(file), line_number, (column or 1), message } or line
+  if file and (severity == "warning" or severity == "error" or severity == "fatal" or severity == "fatal error") then
+    return { severity:find("^fatal") and "error" or severity,
+      core.root_project():normalize_path(file), tonumber(number), tonumber(column) or 1, message }
+  end
+  file, number, column, message = stripped:match(build.file_pattern)
+  return file and { "info", core.root_project():normalize_path(file), tonumber(number), tonumber(column) or 1, message } or line
 end
-
 
 local function default_on_line(line)
   build.message_view:add_message(build.parse_compile_line(line))
 end
 
--- accept a table of commands. Run as many as we have threads.
+---Queue commands and stream complete output lines with bounded concurrency.
+---Start and exit failures finish the bundle once; partial final lines are retained.
+---@param tasks string[][] Commands to execute in the current project
+---@param on_done fun(status:integer)? Completion callback
+---@param on_line fun(line:string)? Output callback
 function build.run_tasks(tasks, on_done, on_line)
-  if #tasks == 0 then
-    if on_done then on_done(0) end
-    return
+  if #tasks == 0 then if on_done then on_done(0) end; return end
+  local bundle = { tasks = {}, on_done = on_done, on_line = on_line or default_on_line, status = 0, cwd = core.root_project().path }
+  for _, arguments in ipairs(tasks) do
+    local cmd = {}
+    for i, value in ipairs(arguments) do cmd[i] = tostring(value) end
+    bundle.tasks[#bundle.tasks + 1] = { cmd = cmd, buffer = "", done = false }
   end
-  local bundle = { tasks = {}, on_done = on_done, on_line = (on_line or default_on_line)  }
-  for i, task in ipairs(tasks) do
-    table.insert(bundle.tasks, { cmd = task, program = nil, done = false })
-  end
-  table.insert(build.running_bundles, bundle)
-
-  if build.thread and core.threads[build.thread] and coroutine.status(core.threads[build.thread].cr) == "dead" then build.thread = nil end
-  if not build.thread then
-    build.thread = core.add_thread(function()
-      local function handle_output(bundle, output)
-        if output ~= nil then
-          local offset = 1
-          while offset < #output do
-            local newline = output:find("\n", offset) or #output
-            if bundle.on_line then
-              bundle.on_line(output:sub(offset, newline-1))
+  build.running_bundles[#build.running_bundles + 1] = bundle
+  if build.thread and (not core.threads[build.thread] or coroutine.status(core.threads[build.thread].cr) == "dead") then build.thread = nil end
+  if build.thread then return end
+  build.thread = core.add_thread(function()
+    local function output(task, owner, chunk, finished)
+      task.buffer = task.buffer .. (chunk or "")
+      while true do
+        local newline = task.buffer:find("\n", 1, true)
+        if not newline then break end
+        owner.on_line(task.buffer:sub(1, newline - 1):gsub("\r$", ""))
+        task.buffer = task.buffer:sub(newline + 1)
+      end
+      if finished and task.buffer ~= "" then
+        owner.on_line(task.buffer:gsub("\r$", ""))
+        task.buffer = ""
+      end
+    end
+    while #build.running_bundles > 0 do
+      local running = 0
+      for i = #build.running_bundles, 1, -1 do
+        local owner = build.running_bundles[i]
+        local unfinished = false
+        for _, task in ipairs(owner.tasks) do
+          if not task.done and task.program then
+            repeat
+              local chunk = task.program:read_stdout()
+              if not chunk or chunk == "" then break end
+              output(task, owner, chunk)
+            until false
+            if task.program:running() then
+              running = running + 1
+            else
+              output(task, owner, nil, true)
+              task.done = true
+              local status = task.program:returncode() or 1
+              if status ~= 0 then owner.status = status end
             end
-            offset = newline + 1
+          end
+          if not task.done then unfinished = true end
+        end
+        if owner.status ~= 0 then
+          for _, task in ipairs(owner.tasks) do
+            if task.program and not task.done then task.program:terminate(); running = running - 1 end
+            task.done = true
+          end
+          unfinished = false
+        end
+        if not unfinished then
+          table.remove(build.running_bundles, i)
+          if owner.on_done then core.try(owner.on_done, owner.status) end
+        end
+      end
+      for _, owner in ipairs(build.running_bundles) do
+        for _, task in ipairs(owner.tasks) do
+          if running >= math.max(1, build.threads) then break end
+          if not task.done and not task.program then
+            build.message_view:add_message(table.concat(task.cmd, " "))
+            local program, err = process.start(task.cmd, {
+              stderr = process.REDIRECT_STDOUT, cwd = owner.cwd,
+              background = PLATFORM == "Windows", env = { TERM = "ansi" }
+            })
+            if not program then
+              owner.on_line("Unable to start " .. tostring(task.cmd[1]) .. ": " .. tostring(err))
+              task.done, owner.status = true, 1
+              break
+            end
+            task.program, running = program, running + 1
           end
         end
       end
-
-      while #build.running_bundles > 0 do
-        local total_running = 0
-        local yield_time = build.interval
-        local status, err = pcall(function()
-          for i, bundle in ipairs(build.running_bundles) do
-            local has_unfinished, bundle_finished
-            for _, task in ipairs(bundle.tasks) do
-              if not task.done then
-                has_unfinished = true
-                if task.program then
-                  while true do
-                    local output = task.program:read_stdout()
-                    handle_output(bundle, output)
-                    if not output or output == "" then break end
-                  end
-                  if task.program:running() then
-                    total_running = total_running + 1
-                  else
-                    task.done = true
-                    local status = task.program:returncode()
-                    if status ~= 0 then
-                      for _, killing_task in ipairs(bundle.tasks) do
-                        if killing_task.program then
-                          killing_task.program:terminate()
-                          total_running = total_running - 1
-                         end
-                      end
-                      bundle_finished = status
-                      break
-                    end
-                  end
-                end
-              end
-            end
-            if not has_unfinished and bundle_finished == nil then bundle_finished = 0 end
-            if bundle_finished ~= nil then
-              if bundle.on_done then bundle.on_done(bundle_finished) end
-              table.remove(build.running_bundles, i)
-              yield_time = 0
-              break
-            end
-          end
-          for i, bundle in ipairs(build.running_bundles) do
-            if total_running < build.threads then
-              for i,task in ipairs(bundle.tasks) do
-                if total_running >= build.threads then break end
-                if not task.done and not task.program then
-                  build.message_view:add_message(table.concat(task.cmd, " "))
-                  task.program = process.start(task.cmd, { ["stderr"] = process.REDIRECT_STDOUT, env = (PLATFORM ~= "Windows" and { TERM = "ansi" } or {}), cwd = core.project_absolute_path(".") })
-                  total_running = total_running + 1
-                end
-              end
-              if total_running >= build.threads then break end
-            end
-          end
-        end)
-        if not status then build.message_view:add_message({ "error", err }) end
-        coroutine.yield(yield_time)
-      end
-      build.thread = nil
-    end, "build-thread")
-  end
+      coroutine.yield(build.interval)
+    end
+    build.thread = nil
+  end, "build-thread")
 end
 
+---Return whether commands are queued or running.
+---@return boolean running
 function build.is_running() return build.thread ~= nil end
+---Write a build status line to the editor log.
+---@param line string Status text
 function build.output(line) core.log_quiet(line) end
 
+---Select a target and restore its most recent program arguments.
+---@param target integer Target index
 function build.set_target(target)
   if not build.targets or #build.targets == 0 then
     core.log_quiet("No build targets available")
@@ -288,8 +290,9 @@ function build.set_target(target)
   end
 
   target = common.clamp(target, 1, #build.targets)
+  build.state.target = target
   config.target_binary = build.targets and build.targets[target] and build.targets[target].binary
-  local arguments = ""
+  local arguments
   for i = #build.state.previous_arguments, 1, -1 do
     local v = build.state.previous_arguments[i]
     if v[1] == build.state.target then
@@ -297,25 +300,39 @@ function build.set_target(target)
       break
     end
   end
-  config.target_binary_arguments = build.argument_string_to_table(arguments)
-  build.state.target = target
+  local parsed = arguments ~= nil and build.argument_string_to_table(arguments)
+    or build.targets[target].binary_arguments or {}
+  if type(parsed) == "string" then parsed = build.argument_string_to_table(parsed) end
+  config.target_binary_arguments = #parsed > 0 and parsed or nil
   save_state()
 end
 
-function build.set_targets(targets, type)
-  build.targets = targets
+---Configure targets and resolve their backend names.
+---@param targets table[]? Build targets
+---@param backend string? Default backend overriding per-target choices
+function build.set_targets(targets, backend)
+  build.targets = targets or {}
+  targets = build.targets
   for i,v in ipairs(targets) do
-    if v.type or type then
-      v.backend = build.get_backends(v.type or type)
+    v.name = v.name or "Target " .. i
+    if backend or type(v.backend) == "string" then
+      v.backend = build.get_backends(backend or v.backend)
+    elseif not v.backend then
+      v.backend = build.get_backends("internal")
     end
   end
-  config.target_binary = build.targets and #build.targets > 0 and build.targets[1].binary
+  if #build.targets > 0 then config.target_binary = build.targets[1].binary end
 end
 
+---Check whether a target can be built.
+---@param target table? Target
+---@return boolean|function? available
 function build.can_build(target)
-  return target.build ~= false and (target.build or (target.backend.build and (not target.backend.can_build or target.backend.can_build(target))))
+  return target and target.backend and target.build ~= false and (target.build or (target.backend.build and (not target.backend.can_build or target.backend.can_build(target))))
 end
 
+---Build the selected target and show diagnostics in the output pane.
+---@param callback fun(status:integer,error:string?)? Completion callback
 function build.build(callback)
   local target = build.targets[build.state.target]
   if build.is_running() or not build.can_build(target) then return false end
@@ -324,16 +341,18 @@ function build.build(callback)
   build.message_view:add_message("Building " .. (target.binary and common.basename(target.binary) or "target") .. "...")
   build.message_view.minimized = false
   local status, err = pcall(function()
-    if not target then error("Can't find target " .. target) end
-    if not target.backend then error("Can't find target " .. target .. " backend.") end
-    target.backend.build(target, function (status)
-      local line = "Completed building " .. (target.binary and common.basename(target.binary) or "target") .. ". " .. status .. " Errors/Warnings."
+    if not target then error("No build target selected") end
+    if not target.backend then error("No backend for target " .. tostring(target.name)) end
+    local perform = type(target.build) == "function" and target.build or target.backend.build
+    perform(target, function (status)
+      local name = target.binary and common.basename(target.binary) or "target"
+      local line = status == 0 and ("Built " .. name .. ".")
+        or ("Build failed for " .. name .. " (exit status " .. status .. ").")
       build.message_view:add_message({ status == 0 and "good" or "error", line })
       build.message_view.visible = status ~= 0 or build.on_success ~= "close"
       build.output(line)
       build.message_view.scroll.to.y = 0
       if status == 0 and build.on_success == "minimize" then build.message_view.minimized = true end
-      build.thread = nil
       if callback then callback(status) end
     end)
   end)
@@ -343,62 +362,79 @@ function build.build(callback)
   end
 end
 
+---Quote argument values for the configured platform shell.
+---@param arguments string[]|string Argument values or an already-written command line
+---@return string[]|string arguments Quoted values
 function build.escape_arguments(arguments)
-  if type(arguments) == "table" then
-    local new_arguments = {}
-    for i,arg in ipairs(arguments) do
-      if not arg:find("[ \"']") then 
-        table.insert(new_arguments, arg)
-      elseif not arg:find("[']") then 
-        table.insert(new_arguments, "'" .. arg .. "'")
-      elseif not arg:find("[\"]") then 
-        table.insert(new_arguments, "\"" .. arg .. "\"")
-      else
-        table.insert(new_arguments, "'" .. arg:gsub("'", "'\"'\"'"):gsub("\\", "\\\\") .. "'")
-      end
-    end
-    return new_arguments
-  end
-  return arguments
-end
-
-function build.get_shell_command(target, command, arguments)
-  local target = build.state.target
-  if type(command) == "function" then
-    command = command(build.targets[target])
-  elseif type(command) == "string" then
-    local arguments = arguments or config.target_binary_arguments or {}
-    local argument_string = type(arguments) == "string" and arguments or ("'" .. table.concat(build.escape_arguments(arguments), "' '") .. "'")
+  if type(arguments) ~= "table" then return arguments end
+  local result = {}
+  for i, value in ipairs(arguments) do
+    value = tostring(value)
     if PLATFORM == "Windows" then
-      command = { build.shell, command, table.unpack(arguments) }
+      result[i] = '"' .. value:gsub('"', '""') .. '"'
     else
-      if not common.is_absolute_path(command) then command = "./" .. command end
-      local cmd = {}
-      for i,v in ipairs(type(build.terminal) == 'table' and build.terminal or { build.terminal }) do table.insert(cmd, type(v) == 'function' and v(build.targets[target], command) or v) end
-      table.insert(cmd, "")
-      for i,v in ipairs(type(build.shell) == 'table' and build.shell or { build.shell }) do cmd[#cmd] = cmd[#cmd] .. (type(v) == 'function' and v(build.targets[target], command) or v) .. " " end
-      cmd[#cmd] = cmd[#cmd] .. "'cd " .. (build.targets[target].wd or core.root_project().path) .. " && " .. command .. " " .. argument_string .. "; echo \"\nProgram exited with error code $?.\n\nPress any key to exit...\"; read'"
-      print(table.concat(cmd, " "))
-      command = cmd
+      result[i] = "'" .. value:gsub("'", "'\"'\"'") .. "'"
     end
   end
-  return command
+  return result
 end
 
-function build.execute_command(command)
-  if PLATFORM == "Windows" then
-    os.execute(table.concat(command, " "))
+---Build a subprocess argument vector with an optional external terminal prefix.
+---@param target table Target whose binary and working directory are used
+---@param executable string|string[]|function Executable, command vector or target callback
+---@param arguments string[]|string? Program arguments
+---@return string[] command Subprocess command without shell quoting around argv elements
+function build.get_shell_command(target, executable, arguments)
+  target = target or build.targets[build.state.target] or {}
+  if type(arguments) == "string" then arguments = build.argument_string_to_table(arguments) end
+  arguments = arguments or config.target_binary_arguments or {}
+  if type(executable) == "function" then return executable(target, arguments) end
+  local values = {}
+  if type(executable) == "table" then
+    for _, value in ipairs(executable) do values[#values + 1] = tostring(value) end
   else
-    build.run_tasks({ command })
+    assert(executable, "No executable configured")
+    if executable == target.binary or executable == config.target_binary then
+      executable = build.get_binary(executable) or core.root_project():absolute_path(executable)
+    end
+    values[1] = executable
   end
+  for _, argument in ipairs(arguments) do values[#values + 1] = tostring(argument) end
+  local quote = build.escape_arguments
+  local cwd = core.root_project():absolute_path(target.wd or ".")
+  local script = (PLATFORM == "Windows" and "cd /d " or "cd ") .. quote({cwd})[1]
+    .. " && " .. table.concat(quote(values), " ")
+  local result = {}
+  local function add(values)
+    if type(values) == "string" then values = build.argument_string_to_table(values) end
+    for _, value in ipairs(values or {}) do
+      result[#result + 1] = type(value) == "function" and value(target, executable) or tostring(value)
+    end
+  end
+  if build.terminal then add(build.terminal) end
+  add(build.shell)
+  result[#result + 1] = script
+  return result
 end
 
+---Execute a command asynchronously through the build output pane.
+---@param command string[] Command and arguments
+function build.execute_command(command)
+  build.message_view.visible, build.message_view.minimized = true, false
+  build.run_tasks({ command })
+end
+
+---Check whether a target has a runnable program or backend.
+---@param target table? Target
+---@return boolean|string|function? available
 function build.can_run(target)
-  return target.run ~= false and (target.run or (target.backend.run and (not target.backend.can_run or target.backend.can_run(target))))
+  return target and target.backend and target.run ~= false and (target.run or target.binary or (target.backend.run and (not target.backend.can_run or target.backend.can_run(target))))
 end
 
+---Run the selected target with optional program arguments.
+---@param arguments string|string[]? Arguments
 function build.run(arguments)
-  local target = build.targets[build.state.target]
+  local target = build.targets[build.state.target] or { binary = config.target_binary, backend = {} }
   if build.is_running() or not build.can_run(target) then return false end
   build.message_view:clear_messages()
   if target.backend.run then
@@ -408,47 +444,67 @@ function build.run(arguments)
   end
 end
 
+---Check whether a target supports cleaning its generated outputs.
+---@param target table? Target
+---@return boolean|function? available
 function build.can_clean(target)
-    return target.clean ~= false and (target.clean or (target.backend.clean and (not target.backend.can_clean or target.blackend.can_clean(target))))
+    return target and target.backend and target.clean ~= false and (target.clean or (target.backend.clean and (not target.backend.can_clean or target.backend.can_clean(target))))
 end
 
+---Clean the selected target and report success or failure.
+---@param callback fun(status:integer,error:string?)? Completion callback
 function build.clean(callback)
   local target = build.targets[build.state.target]
   if build.is_running() or not build.can_clean(target) then return false end
   build.message_view:clear_messages()
-  build.message_view.visible = true
-  build.message_view.minimized = false
-  build.message_view:add_message("Started clean " .. (target.binary or "target") .. ".")
-  target.backend.clean(target, function(...)
-    build.message_view:add_message({ "good", "Completed cleaning " .. (target.binary or "target") .. "." })
-    if build.on_success == "minimize" then build.message_view.minimized = true end
-    if callback then callback(...) end
+  build.message_view.visible, build.message_view.minimized = true, false
+  build.message_view:add_message("Started cleaning " .. (target.binary or "target") .. ".")
+  local perform = type(target.clean) == "function" and target.clean or target.backend.clean
+  local ok, err = pcall(perform, target, function(status)
+    status = status or 0
+    build.message_view:add_message({ status == 0 and "good" or "error",
+      (status == 0 and "Completed cleaning " or "Failed cleaning ") .. (target.binary or "target") .. "." })
+    if status == 0 and build.on_success == "minimize" then build.message_view.minimized = true end
+    if callback then callback(status) end
   end)
+  if not ok then
+    build.message_view:add_message({ "error", err })
+    if callback then callback(-1, err) end
+  end
 end
 
+---Cancel queued work before notifying callbacks so follow-up tasks remain valid.
+---@param force boolean Whether to kill rather than terminate subprocesses
+local function stop_tasks(force)
+  local bundles = build.running_bundles
+  build.running_bundles = {}
+  for _, bundle in ipairs(bundles) do
+    for _, task in ipairs(bundle.tasks) do
+      if task.program and not task.done then
+        if force then task.program:kill() else task.program:terminate() end
+      end
+      task.done = true
+    end
+    if bundle.on_done then core.try(bundle.on_done, 1) end
+  end
+end
+
+---Terminate active commands and report cancellation once to their callbacks.
+---@param callback function? Cancellation callback
+---@return false? unavailable False when no build is running
 function build.terminate(callback)
   if not build.is_running() then return false end
-  for i, bundle in ipairs(build.running_bundles) do
-    for j, task in ipairs(bundle.tasks) do
-      if task.program and not task.done then
-        task.program:terminate()
-        task.done = true
-      end
-    end
-    if bundle.on_done then bundle.on_done(1) end
-  end
-  build.running_bundles = {}
+  stop_tasks(false)
   build.message_view:add_message({ "warning", "Terminated running build." })
   if callback then callback() end
 end
 
+---Kill active commands and report cancellation once to their callbacks.
+---@param callback function? Cancellation callback
+---@return false? unavailable False when no build is running
 function build.kill(callback)
   if not build.is_running() then return false end
-  for i, bundle in ipairs(build.running_bundles) do
-    for j, task in ipairs(bundle.tasks) do
-      if task.program then task.program:kill() end
-    end
-  end
+  stop_tasks(true)
   build.message_view:add_message({ "error", "Killed running build." })
   if callback then callback() end
 end
@@ -458,7 +514,7 @@ end
 core.status_view:add_item({
   predicate = function() return build.state.target and build.targets[build.state.target] and build.targets[build.state.target].backend end,
   name = "build:target",
-  alignemnt = StatusView.Item.RIGHT,
+  alignment = StatusView.Item.RIGHT,
   get_item = function()
     local dv = core.active_view
     return {
@@ -467,7 +523,7 @@ core.status_view:add_item({
   end,
   command = function()
      core.command_view:enter("Select Build Target", {
-      text = build.targets[build.state.target].name,
+      text = build.targets[build.state.target].name or "",
       submit = function(text)
         local has = false
         for i,v in ipairs(build.targets) do
@@ -535,6 +591,7 @@ end
 
 function BuildMessageView:clear_messages()
   self.messages = {}
+  self.measured_messages, self.messages_width = 0, 0
   self.hovered_message = nil
   self.active_message = nil
   self.active_file = nil
@@ -553,8 +610,23 @@ function BuildMessageView:get_item_height()
   return style.build.font:get_height() + style.padding.y
 end
 
+---Measure new messages once and invalidate cached widths on font changes.
+---@return number width Content width
 function BuildMessageView:get_h_scrollable_size()
-  return math.huge
+  local font = style.build.font
+  if self.width_font ~= font or self.width_font_size ~= font:get_size() then
+    self.width_font, self.width_font_size = font, font:get_size()
+    self.measured_messages, self.messages_width = 0, 0
+  end
+  for i = (self.measured_messages or 0) + 1, #self.messages do
+    local message = self.messages[i]
+    local text = type(message) == "table" and (#message > 2
+      and (message[2] .. ":" .. message[3] .. " [" .. message[1] .. "]: " .. message[5]) or message[2]) or message
+    self.messages_width = math.max(self.messages_width or 0,
+      font:get_width((text:gsub("\27%[[%d;]*%a", ""))) + style.padding.x * 2)
+  end
+  self.measured_messages = #self.messages
+  return self.messages_width or 0
 end
 
 function BuildMessageView:get_scrollable_size()
@@ -563,7 +635,7 @@ end
 
 function BuildMessageView:on_mouse_moved(px, py, ...)
   BuildMessageView.super.on_mouse_moved(self, px, py, ...)
-  if self.dragging_scrollbar then return end
+  if self:scrollbar_dragging() or self:scrollbar_hovering() then self.hovered_message = nil; return end
   local ox, oy = self:get_content_offset()
   if px > self.position.x and py > self.position.y and px < self.position.x + self.size.x and py < self.position.y + self.size.y then
     local offset = math.floor((py - oy) / self:get_item_height())
@@ -573,6 +645,12 @@ function BuildMessageView:on_mouse_moved(px, py, ...)
   end
 end
 
+
+---Clear row hover when a popup or another view owns the pointer.
+function BuildMessageView:on_mouse_left()
+  BuildMessageView.super.on_mouse_left(self)
+  self.hovered_message = nil
+end
 
 local ansi_colors = {
   [30] = { 0, 0, 0 },
@@ -651,9 +729,11 @@ end
 
 local BuildBarView = ToolbarView:extend()
 
+---Create a horizontal toolbar inside the build output drawer.
 function BuildBarView:new()
   BuildBarView.super.new(self)
-  self.toolbar_font = renderer.font.load(get_plugin_directory() .. PATHSEP .. "build.ttf", style.icon_big_font:get_size())
+  self:set_orientation("horizontal")
+  self.toolbar_font = renderer.font.load(plugin_directory .. PATHSEP .. "build.ttf", style.icon_big_font:get_size())
   self.toolbar_commands = {
     {symbol = "!", command = "build:build"},
     {symbol = '"', command = "build:run-or-term-or-kill"},
@@ -666,9 +746,11 @@ end
 
 build.build_bar_view = BuildBarView()
 build.message_view = BuildMessageView()
-local node = core.root_view:get_active_node()
+local node = core.root_view:get_active_node_default()
 build.message_view_node = node:split("down", build.message_view, { y = true }, true)
-build.build_bar_node = TreeView and TreeView.node.b:split("up", build.build_bar_view, {y = true})
+local drawer = build.message_view_node
+build.build_bar_node = drawer:split("up", build.build_bar_view, { y = true })
+build.message_view_node = drawer.b
 
 
 
@@ -684,17 +766,14 @@ core.status_view:add_item({
   end,
   command = function()
      core.command_view:enter("Set Target Binary", {
-      text = config.target_binary .. (config.target_binary_arguments and (" " .. table.concat(build.escape_arguments(config.target_binary_arguments), " ")) or ""),
+      text = table.concat(build.escape_arguments({ config.target_binary }), " ")
+        .. (config.target_binary_arguments and (" " .. table.concat(build.escape_arguments(config.target_binary_arguments), " ")) or ""),
       submit = function(text)
-        local i = text:find(" ")
-        if i then
-          config.target_binary = text:sub(1, i-1)
-          config.target_binary_arguments = build.argument_string_to_table(text:sub(i+1))
-        else
-          config.target_binary = text
-          config.target_binary_arguments = nil
-        end
-        table.insert(build.state.previous_arguments, { build.state.target, i and text:sub(i+1) })
+        local arguments = build.argument_string_to_table(text)
+        config.target_binary = table.remove(arguments, 1)
+        config.target_binary_arguments = #arguments > 0 and arguments or nil
+        table.insert(build.state.previous_arguments, { build.state.target,
+          table.concat(build.escape_arguments(arguments), " ") })
         if #build.state.previous_arguments > build.max_previous_arguments then table.remove(build.state.previous_arguments, 1) end
         save_state()
       end
@@ -762,8 +841,8 @@ command.add(function(root_view, arguments)
   return not build.is_running() and build.can_build(build.targets[build.state.target]) and build.can_clean(build.targets[build.state.target]), arguments
 end, {
   ["build:rebuild"] = function()
-    build.clean(function()
-      if #build.targets > 0 then
+    build.clean(function(status)
+      if status == 0 and #build.targets > 0 then
         build.build()
       end
     end)
@@ -780,7 +859,7 @@ end, {
 })
 
 command.add(function(root_view, arguments)
-  return build.state.target
+  return #build.targets > 0
 end, {
   ["build:next-target"] = function()
     if #build.targets > 0 then
@@ -798,7 +877,7 @@ end, {
 })
 
 command.add(function(root_view, options)
-  return (config.target_binary and system.get_file_info(core.root_project():absolute_path(config.target_binary))) or build.can_run(build.targets[build.state.target]), options
+  return build.is_running() or build.get_binary(config.target_binary) or build.can_run(build.targets[build.state.target]), options
 end, {
   ["build:run-or-term-or-kill"] = function(arguments)
     if build.is_running() then
@@ -816,7 +895,7 @@ end, {
   ["build:run-or-term-or-kill-with-arguments"] = function(arguments)
     local relevant_previous_arguments
     for i,v in ipairs(build.state.previous_arguments) do if v[1] == build.state.target then relevant_previous_arguments = v[2] break end end
-    core.command_view:enter(config.target_binary .. " ", {
+    core.command_view:enter((config.target_binary or build.targets[build.state.target].name) .. " ", {
       submit = function(text)
         config.target_binary_arguments = build.argument_string_to_table(text)
         command.perform("build:run-or-term-or-kill", text)
@@ -832,7 +911,11 @@ end, {
         save_state()
       end,
       suggest = function(text)
-        return common.fuzzy_match(build.state.previous_arguments, text)
+        local arguments = {}
+        for _, previous in ipairs(build.state.previous_arguments) do
+          if previous[1] == build.state.target and previous[2] then arguments[#arguments + 1] = previous[2] end
+        end
+        return common.fuzzy_match(arguments, text)
       end,
       text = relevant_previous_arguments or ""
     })
@@ -840,7 +923,10 @@ end, {
 })
 
 local function select_target_commandview(submit, target, condition)
-  if target then submit(target) end
+  if target then
+    for i, candidate in ipairs(build.targets) do if candidate == target then submit(target, i); return end end
+    return
+  end
   local target_names = {}
   for i,v in ipairs(build.targets) do if (not condition or condition(v)) then table.insert(target_names, v.name) end end
   if #target_names == 0 then
@@ -849,7 +935,7 @@ local function select_target_commandview(submit, target, condition)
   end
   core.command_view:enter("Select Target", {
     submit = function(text)
-      for i,v in ipairs(build.targets) do if v.name == text then submit(v, i) end end
+      for i,v in ipairs(build.targets) do if v.name == text then submit(v, i); return end end
     end,
     suggest = function(text)
       return common.fuzzy_match(target_names, text)
@@ -903,16 +989,33 @@ keymap.add {
   ["ctrl+shift+e"]       = "build:run-or-term-or-kill-with-arguments",
   ["ctrl+t"]             = "build:next-target",
   ["ctrl+shift+t"]       = "build:select-target",
-  ["ctrl+alt+e"]         = "build:select-target-and-run",
+  ["ctrl+shift+alt+e"]   = "build:select-target-and-run",
   ["ctrl+shift+alt+b"]   = "build:select-target-and-build",
   ["ctrl+shift+b"]       = "build:clean",
   ["f6"]                 = "build:toggle-drawer",
   ["escape"]             = "build:contextual-close-drawer"
 }
 
+core.menu_view:register({ "tools" }, {
+  core.menu_view.DIVIDER,
+  { id = "build", text = "Build", items = {
+    { id = "build", text = "Build", command = "build:build" },
+    { id = "run", text = "Run", command = "build:run-or-term-or-kill" },
+    { id = "build-run", text = "Build and Run", command = "build:build-and-run" },
+    { id = "arguments", text = "Run with Arguments...", command = "build:run-or-term-or-kill-with-arguments" },
+    core.menu_view.DIVIDER,
+    { id = "target", text = "Select Target...", command = "build:select-target" },
+    { id = "clean", text = "Clean", command = "build:clean" },
+    { id = "rebuild", text = "Rebuild", command = "build:rebuild" },
+    { id = "stop", text = "Stop", command = "build:terminate" },
+    { id = "output", text = "Show Build Output", command = "build:toggle-drawer",
+      checked = function() return build.message_view.visible end }
+  } }
+}, "build")
+
 core.add_thread(function()
   if config.plugins.build.targets then
-    build.set_targets(config.plugins.build.targets, config.plugins.build.type or "internal")
+    build.set_targets(config.plugins.build.targets, config.plugins.build.type)
   else
     local backends = build.get_backends()
     table.sort(backends, function(a,b) return (a.priority or 0) < (b.priority or 0) end)
@@ -935,6 +1038,7 @@ core.add_thread(function()
     build.set_targets(targets)
   end
   build.set_target(build.state.target)
+  build.initialized = true
 end)
 
 return build

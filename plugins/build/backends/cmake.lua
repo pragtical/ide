@@ -1,91 +1,47 @@
 local core = require "core"
-local common = require "core.common"
 local build = require "plugins.build"
-local config = require "core.config"
-local json = require "libraries.json"
+local util = require "plugins.build.util"
 
 local cmake = {}
 
-local function grep(t, cond) local nt = {} for i,v in ipairs(t) do if cond(v, i) then table.insert(nt, v) end end return nt end
-
-local function get_build_directory(target)
-  return target.build_directory or core.root_project().path .. PATHSEP .. (target.build_directory or ("build-" .. target.name:lower():gsub("%W+", "-"):gsub("%-+", "-"):gsub("^%-", ""):gsub("%-$", "")))
-end
-
+---Infer configuration names without treating them as CMake target names.
+---@return table[]? targets Debug and release configurations when a project exists
 function cmake.infer()
-  return system.get_file_info(core.root_project().path .. PATHSEP .. "CMakeLists.txt") and {
-    { name = "debug", buildtype = "debug" },
-    { name = "release", buildtype = "release" }
-  }
-end
-
-local function run_command(args)
-  local proc = process.start(args)
-  local accumulator = ""
-  while true do
-    local chunk = proc:read_stdout(4096)
-    if not chunk or (chunk == "" and not proc:running()) then break end
-    accumulator = accumulator .. chunk
-    coroutine.yield()
+  if system.get_file_info(core.root_project():absolute_path("CMakeLists.txt")) then
+    return { { name = "debug", buildtype = "Debug" }, { name = "release", buildtype = "Release" } }
   end
-  local status = proc:returncode()
-  if status ~= 0 then error(proc:read_stderr(4096)) end
-  return accumulator
 end
 
+---Configure when necessary and stop before building if configuration fails.
+---@param target table Build target; build_target optionally names a CMake target
+---@param callback fun(status:integer)? Completion callback
 function cmake.build(target, callback)
-  local bd = get_build_directory(target)
-  local tasks = { }
-
-  local run_build = function()
-    local cmd = { "cmake", "--build", bd}
-    if target.name then
-        table.insert(cmd, "--target")
-        table.insert(cmd, target.name)
+  local directory = util.build_directory(target)
+  local function compile()
+    local args = { "cmake", "--build", directory, "--parallel", tostring(build.threads) }
+    if target.build_target then
+      args[#args + 1], args[#args + 2] = "--target", target.build_target
     end
-    table.insert(cmd, "--")
-    table.insert(cmd, "-j")
-    table.insert(cmd, build.threads)
-    build.run_tasks({ cmd }, function(status)
-      local filtered_messages = grep(build.message_view.messages, function(v) return type(v) == 'table' and v[1] == "error" end)
-      if callback then callback(status == 0 and #filtered_messages or 1) end
-    end, function(line)
-      build.message_view:add_message(build.parse_compile_line(line))
+    build.run_tasks({ args }, function(status)
+      if callback then callback(util.build_status(build, status)) end
     end)
   end
-
-  if not system.get_file_info(bd) then
-    common.mkdirp(bd)
-    build.run_tasks({ { "cmake", "-B" .. bd, "-S" .. core.root_project().path, "-DCMAKE_BUILD_TYPE=" .. (target.buildtype or "debug") } }, function(status)
-      core.add_thread(function()
-        run_build()
-      end)
-    end)
+  if system.get_file_info(directory .. PATHSEP .. "CMakeCache.txt") then
+    compile()
   else
-    if not target.checked then
-      core.add_thread(function()
-        run_build()
-      end)
-    else
-      run_build()
-    end
+    build.run_tasks({ { "cmake", "-S", core.root_project().path, "-B", directory,
+      "-DCMAKE_BUILD_TYPE=" .. (target.buildtype or "Debug") } }, function(status)
+      if status ~= 0 then if callback then callback(status) end; return end
+      compile()
+    end)
   end
 end
 
-
+---Clean generated outputs without deleting the user's build directory.
+---@param target table Build target
+---@param callback fun(status:integer)? Completion callback
 function cmake.clean(target, callback)
-  local bd = get_build_directory(target)
-
-  local cmd = { "cmake", "--build", bd, "--target", "clean" }
- 
-  build.run_tasks({ cmd }, function(status)
-    if callback then 
-      callback(status) 
-    end
-  end, function(line)
-    build.message_view:add_message(build.parse_compile_line(line))
-  end)
+  build.run_tasks({ { "cmake", "--build", util.build_directory(target), "--target", "clean" } }, callback)
 end
-
 
 return cmake

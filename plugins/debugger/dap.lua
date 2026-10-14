@@ -1,174 +1,229 @@
-
 local core = require "core"
-local common = require "core.common"
-local style  = require "core.style"
-local config  = require "core.config"
-local json = require "libraries.json"
+local config = require "core.config"
+local json = require "core.json"
 
-local dap = {
-  running_program = nil,
-  command_queue = { },
-  breakpoints = { },
-  debugger_stopped = nil,
-  debugger_completed = nil,
-  idx = 1,
-  thread_id = 1,
-  frame_id = 1,
-  debug = config.plugins.debugger.debug
-}
+---@class plugins.debugger.dap
+local dap = { command_queue = {}, breakpoints = {}, sequence = 0, thread_id = 1, frame_id = nil }
 
-local function parse_request(requests)
-  local s,e,length = requests:find("^Content%-Length: (%d+)\r\n\r\n")
-  if not s then return end
-  return json.decode(requests:sub(e + 1, e + length)), requests:sub(e + length + 1)
+---Decode one complete framed message, retaining incomplete headers and bodies.
+---@param buffer string Buffered adapter bytes
+---@return table? message Decoded complete message
+---@return string remainder Bytes not consumed by this message
+function dap.parse_message(buffer)
+  local header_end = buffer:find("\r\n\r\n", 1, true)
+  if not header_end then return nil, buffer end
+  local length = tonumber(buffer:sub(1, header_end - 1):match("[Cc]ontent%-[Ll]ength:%s*(%d+)"))
+  assert(length, "Missing DAP Content-Length")
+  local body_start = header_end + 4
+  if #buffer < body_start + length - 1 then return nil, buffer end
+  local message, err = json.decode(buffer:sub(body_start, body_start + length - 1))
+  assert(type(message) == "table", err or "Invalid DAP JSON message")
+  return message, buffer:sub(body_start + length)
 end
 
-function dap:cmd(command, arguments, on_finish)
-  local cmd = json.encode({
-    seq = self.idx,
-    type = "request",
-    command = command,
-    arguments = arguments
-  }):gsub("\"arguments\":%[%]", "\"arguments\":{}")
-  if self.debug then print("<<<", cmd) end
-  self.running_program:write("Content-Length: " .. #cmd .. "\r\n\r\n" .. cmd)
-  if on_finish then self.command_queue[self.idx] = on_finish end
-  self.idx = self.idx + 1
+---Queue a request; response callbacks receive the response body and any error.
+---@param name string DAP request name
+---@param arguments table? Request arguments
+---@param callback fun(body:table,error:string?)? Response callback
+function dap:cmd(name, arguments, callback)
+  self.sequence = self.sequence + 1
+  local payload = json.encode { seq = self.sequence, type = "request", command = name, arguments = arguments or {} }
+  -- core.json encodes empty tables as objects; DAP requires an array here.
+  payload = payload:gsub('"breakpoints":{}', '"breakpoints":[]')
+  self.pending_output = (self.pending_output or "") .. "Content-Length: " .. #payload .. "\r\n\r\n" .. payload
+  if callback then self.command_queue[self.sequence] = callback end
 end
-function dap:should_engage(path) return false end
-function dap:step_into()  self:cmd("stepIn") end
-function dap:step_over()  self:cmd("next") end
-function dap:step_out()   self:cmd("stepOut") end
-function dap:continue()   self:cmd("continue", { threadId = 1 }) end
-function dap:halt()       self.running_program:interrupt() end
-function dap:terminate()  self.running_program:terminate() end
-function dap:frame(idx)   self.frame_id = idx end
 
+---Use DAP only when explicitly selected in the debugger configuration.
+---@param path string Executable path
+---@return boolean supported Whether DAP is the configured backend
+function dap:should_engage(path) return config.plugins.debugger.backend == "dap" end
+---Step into a source statement on the stopped thread.
+function dap:step_into() self:cmd("stepIn", { threadId = self.thread_id }) end
+---Step over a source statement on the stopped thread.
+function dap:step_over() self:cmd("next", { threadId = self.thread_id }) end
+---Step out of the selected frame.
+function dap:step_out() self:cmd("stepOut", { threadId = self.thread_id }) end
+---Resume the stopped thread.
+function dap:continue() self:cmd("continue", { threadId = self.thread_id }) end
+---Ask the adapter to pause its debuggee.
+function dap:halt() self:cmd("pause", { threadId = self.thread_id }) end
+---Terminate an owned adapter session without notifying the model twice.
+function dap:terminate()
+  self.completed = true
+  if self.running_program then self.running_program:terminate() end
+end
+
+---Select a displayed frame, mapping its zero-based row to the adapter's frame ID.
+---@param index integer Zero-based stack row
+---@param callback function? Completion callback
+function dap:frame(index, callback)
+  self.frame_id = self.frame_ids and self.frame_ids[index + 1] or nil
+  if callback then callback() end
+end
+
+---Send the complete breakpoint set for one source, including an empty clear request.
+---@param path string Source filename
 function dap:refresh_breakpoints(path)
   local breakpoints = {}
-  if self.breakpoints[path] then
-    for line,v in pairs(self.breakpoints[path]) do
-      table.insert(breakpoints, { line = line })
-    end
+  for line, enabled in pairs(self.breakpoints[path] or {}) do
+    if enabled then breakpoints[#breakpoints + 1] = { line = line } end
   end
-  self:cmd("setBreakpoints", {
-    source = { path = path },
-    breakpoints = breakpoints
-  })
+  table.sort(breakpoints, function(a, b) return a.line < b.line end)
+  self:cmd("setBreakpoints", { source = { path = path }, breakpoints = breakpoints })
 end
 
-function dap:add_breakpoint(path, line)
-  if not self.breakpoints[path] then self.breakpoints[path] = {} end
+---Add a breakpoint to the adapter's source set.
+---@param path string Source filename
+---@param line integer Source line
+---@param callback function? Completion callback
+function dap:add_breakpoint(path, line, callback)
+  self.breakpoints[path] = self.breakpoints[path] or {}
   self.breakpoints[path][line] = true
   self:refresh_breakpoints(path)
+  if callback then callback() end
 end
 
-function dap:remove_breakpoint(path, line)
-  if self.breakpoints[path] and self.breakpoints[path][line]  then
-    self.breakpoints[path][line] = false
-    self:refresh_breakpoints(path)
+---Remove a breakpoint from the adapter's source set.
+---@param path string Source filename
+---@param line integer Source line
+---@param callback function? Completion callback
+function dap:remove_breakpoint(path, line, callback)
+  if self.breakpoints[path] then self.breakpoints[path][line] = nil end
+  self:refresh_breakpoints(path)
+  if callback then callback() end
+end
+
+---Evaluate a watch expression in the selected stack frame.
+---@param expression string Expression to evaluate
+---@param callback fun(value:string?) Evaluation callback
+function dap:variable(expression, callback)
+  if self.frame_id == nil then
+    self:stacktrace(function(frames)
+      if #frames > 0 then self:variable(expression, callback) else callback(nil) end
+    end)
+    return
   end
-end
-
-
-function dap:print(expr, on_finish)
-  self:cmd("evaluate", {}, on_finish)
-  if self.running_thread and core.threads[self.running_thread] then
-    coroutine.resume(core.threads[self.running_thread].cr)
-  end
-end
-
-function dap:variable(variable, on_finish)
-  self:print(variable, function(result)
-    on_finish(result:gsub("\\n$", ""))
+  self:cmd("evaluate", { expression = expression, frameId = self.frame_id, context = "watch" }, function(body, err)
+    callback(not err and body.result or nil)
   end)
 end
 
-function dap:stacktrace(on_finish)
-  self:cmd("threads", { })
-  self:cmd("stackTrace", {
-    threadId = self.thread_id,
-  }, function(res)
+dap.print = dap.variable
+
+---Retrieve source frames and retain their adapter IDs for subsequent watch evaluation.
+---@param callback fun(frames:table[]) Stack callback
+function dap:stacktrace(callback)
+  self:cmd("stackTrace", { threadId = self.thread_id }, function(body)
     local stack = {}
-    for k,v in ipairs(res.stackFrames) do
-      table.insert(stack, { v.name, "", v.source.path, v.line and tonumber(line) })
+    self.frame_ids = {}
+    for _, frame in ipairs(body.stackFrames or {}) do
+      stack[#stack + 1] = { frame.name or "?", "", frame.source and frame.source.path, tonumber(frame.line) }
+      self.frame_ids[#stack] = frame.id
     end
-    on_finish(stack)
+    self.frame_id = self.frame_ids[1]
+    callback(stack)
   end)
 end
 
-function dap:instruction(on_finish)
-  if self.stack_frame then
-    on_finish(table.unpack(self.stack_frame))
-  end
+---Return the last recorded source location when one is available.
+---@param callback function Location callback
+function dap:instruction(callback)
+  if self.stack_frame then callback(table.unpack(self.stack_frame)) end
 end
 
+---Complete the session once on adapter termination or process failure.
+function dap:finish()
+  if self.completed then return end
+  self.completed = true
+  if self.debugger_completed then self.debugger_completed() end
+end
 
+---Handle all complete buffered responses/events and retain partial I/O.
+---@return boolean running Whether the adapter loop should continue
 function dap:loop()
-  local chunk = self.running_program:read_stdout()
-  if chunk and #chunk > 0 then
-    if self.debug then print(">>>", chunk) end
-    self.accumulator = self.accumulator .. chunk
+  if self.completed then return false end
+  local proc = self.running_program
+  if self.pending_output ~= "" then
+    local written, err = proc:write(self.pending_output)
+    if written then self.pending_output = self.pending_output:sub(written + 1)
+    elseif err ~= process.ERROR_WOULDBLOCK then core.error("DAP write failed: %s", tostring(err)); self:finish(); proc:terminate(); return false end
   end
+  local chunk = proc:read_stdout()
+  self.accumulator = self.accumulator .. (chunk or "")
   while true do
-    local request, remainder = parse_request(self.accumulator)
-    if not request then break end
+    local ok, message, remainder = pcall(self.parse_message, self.accumulator)
+    if not ok then core.error("Invalid DAP response: %s", message); self:finish(); proc:terminate(); return false end
+    if not message then break end
     self.accumulator = remainder
-    if request['type'] == 'response' then
-      if not request['success'] and request['message'] then
-        core.error(request['message'])
-      end
-      if request['request_seq'] and self.command_queue[request['request_seq']] then
-        self.command_queue[request['request_seq']](request)
-        self.command_queue[request['request_seq']] = nil
-        local has_any = false
-        for k,v in pairs(self.command_queue) do if v then has_any = true end end
-        if not has_any then self.command_queue = {} end
-      end
-    elseif request['type'] == 'event' then
-      if request['event'] == 'stopped' then
+    if message.type == "response" and message.request_seq then
+      local callback = self.command_queue[message.request_seq]
+      self.command_queue[message.request_seq] = nil
+      local err = message.success == false and (message.message or "Adapter request failed") or nil
+      if err then core.error("DAP: %s", err) end
+      if callback then callback(message.body or {}, err) end
+      if self.completed then return false end
+    elseif message.type == "event" then
+      if message.event == "initialized" and not self.started then
+        self.started = true
+        self.debugger_started()
+        self:cmd("configurationDone")
+      elseif message.event == "stopped" then
+        self.frame_id, self.frame_ids = nil, nil
+        self.thread_id = message.body and message.body.threadId or self.thread_id
         self.debugger_stopped()
-      elseif request['event'] == 'terminated' or request['event'] == 'exited' then
-        self.debugger_completed()
+      elseif message.event == "terminated" or message.event == "exited" then
+        self:finish()
+        proc:terminate()
         return false
-      elseif request['event'] == "output" and request.body then
-        local _, _, brkptn, memory, file, line = request.body.output:find("Breakpoint (%d+) at ([^%s]+): file (.*), line (%d+).")
-        if brkptn then
-          self.stack_frame = {
-            file,
-            tonumber(line),
-            memory
-          }
-          self.debugger_stopped()
-        end
+      elseif message.event == "output" and message.body and self.debugger_out then
+        self.debugger_out(message.body.output or "", message.body.category or "stdout")
       end
     end
   end
+  local err = proc:read_stderr()
+  if err and err ~= "" and self.debugger_out then self.debugger_out(err, "stderr") end
+  if chunk == nil and not proc:running() then self:finish(); return false end
   return true
 end
 
-
-function dap:start(program, arguments, started, stopped, completed)
-  self.debugger_started = started
-  self.debugger_stopped = stopped
-  self.debugger_completed = completed
+---Launch a configured adapter and negotiate capabilities before launching the program.
+---@param program string Executable path
+---@param arguments string[]? Program arguments
+---@param started function Configuration callback
+---@param stopped function Pause callback
+---@param completed function Completion callback
+---@param out function? Output callback
+function dap:start(program, arguments, started, stopped, completed, out)
+  self.session = (self.session or 0) + 1
+  local session = self.session
+  self.command_queue, self.breakpoints, self.sequence = {}, {}, 0
+  self.accumulator, self.pending_output = "", ""
+  self.started, self.completed = false, false
+  self.thread_id, self.frame_id, self.frame_ids, self.stack_frame = 1, nil, nil, nil
+  self.debugger_started, self.debugger_stopped, self.debugger_completed, self.debugger_out = started, stopped, completed, out
   self.running_thread = core.add_thread(function()
-    self.running_program = process.start({ "gdb", "-q", "-nx", "-i=dap", "--args", program, table.unpack(arguments) })
-    self.accumulator = ""
-    coroutine.yield(1)
-    self:cmd("intitialize", { }, function()
-      self:cmd("launch", { })
-      self:debugger_started()
-      -- self:continue()
+    if self.session ~= session or self.completed then return end
+    local settings = config.plugins.debugger
+    local args = settings.dap_command or { settings.gdb_path or "gdb", "-q", "-nx", "--interpreter=dap" }
+    local err
+    self.running_program, err = process.start(args, { cwd = core.root_project().path, background = PLATFORM == "Windows" })
+    if not self.running_program then core.error("Unable to start debug adapter: %s", tostring(err)); self:finish(); return end
+    self:cmd("initialize", { clientID = "pragtical", clientName = "Pragtical", adapterID = "gdb",
+      pathFormat = "path", linesStartAt1 = true, columnsStartAt1 = true }, function(_, initialize_error)
+      if initialize_error then self.running_program:terminate(); self:finish(); return end
+      local options = { program = core.root_project():absolute_path(program), cwd = core.root_project().path, stopOnEntry = true }
+      if arguments and #arguments > 0 then options.args = arguments end
+      self:cmd("launch", options, function(_, launch_error)
+        if launch_error then self.running_program:terminate(); self:finish() end
+      end)
     end)
-    while self:loop() do coroutine.yield(config.plugins.debugger.interval) end
-    self.running_program = nil
-    self.running_thread = nil
+    while self.session == session and self:loop() do coroutine.yield(settings.interval or 0.01) end
+    if self.session == session then self.running_program, self.running_thread = nil, nil end
   end)
 end
 
-function dap:attach(terminal, started, stopped, completed)
-  error("cannot attach with dap")
-end
+---Reject terminal attachment, which requires GDB's machine-interface stream.
+function dap:attach() error("Terminal attachment is supported only by the GDB backend") end
 
 return dap

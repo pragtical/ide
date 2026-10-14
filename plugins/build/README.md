@@ -1,66 +1,64 @@
-## Build Plugin
+# Build plugin API
 
-The build plugin works on a set of *targets*, that are either specified by a combination of the project config and user config, or, if no targets are specified, inferred automatically from the installed build backends.
+The build plugin operates on targets supplied by project/user configuration or
+inferred by registered backends. Configure each target with:
 
-### Targets
+| Field | Meaning |
+| --- | --- |
+| `name` | Target/configuration label |
+| `backend` | Backend name or backend table |
+| `binary` | Program to run/debug, relative to the project or absolute |
+| `wd` | Program working directory, relative to the project |
+| `run` | Program command vector or callback; `false` disables running |
+| `build`, `clean` | Optional replacement callbacks; `false` disables the operation |
 
-Targets are the basis of the build plugin. Different build systems can co-exist simultaneously. By default, there are only three fields in a target:
+A replacement callback receives `(target, callback)` and reports an integer exit
+status through `callback(status)`: zero succeeds, nonzero fails.
 
-* `name`: The identifier of the target.
-* `binary`: The path to the primary executable.
-* `backend`: Either the backend itself, or the name of a registered backend.
-* `wd`: The working directory to run the `binary` in when executed.
-* `run`: The command necessary to execute this target. If blank, will execute `binary`.
+## Backends
 
-### Backends
+A module in `plugins/build/backends` supplies `build(target, callback)` and
+`clean(target, callback)`. Optional methods are `run(target)`, `can_build(target)`,
+`can_clean(target)`, `can_run(target)` and `infer()`. Inference runs in an editor
+coroutine and returns an array of targets. `priority` controls inference order;
+the internal backend is the fallback when no other system is found.
 
-Backends **should** supply the following methods:
+Use `build.run_tasks(commands, on_done, on_line)` to execute an array of argument
+vectors asynchronously. Concurrency is limited by `config.plugins.build.threads`.
+The completion callback receives the aggregate exit status. Output callbacks
+receive complete lines, including a final line without a newline. The default
+output callback parses diagnostics into the build pane. Start failures and
+cancellation complete once with a nonzero status. A completion callback may queue
+the next stage of work.
 
-* `build(target, callback)`: Builds the specified target.
-* `clean(target, callback)`: Cleans the specified target.
+`build.parse_compile_line(line)` returns plain text or a diagnostic table:
+`{ severity, filename, line, column, message }`. Severity is `error`, `warning` or
+`info`. Positions are numeric and Windows drive-letter filenames are supported.
+Custom `error_pattern` and `file_pattern` configuration can override the compiler
+patterns; captures should follow the same field order.
 
-Backends **can** supply the following methods:
+`build.set_targets(targets, backend)` resolves backend names. An optional backend
+argument selects one backend for all targets. `build.set_target(index)` selects
+a target and restores its recent arguments. `build.build`, `build.clean`,
+`build.run`, `build.terminate` and `build.kill` control the current selection.
+Check `build.is_running()` before starting another operation.
 
-* `infer()`: Called in a coroutine; returns the list of targets that this backend supports for this project.
-* `priority`: The order in which `infer` is called, so build systems can act as fallbacks. Default 0, sorting ascending.
+## Built-in backends
 
-#### make
+- Make detects `Makefile`, infers an `all` target, and uses the target name as the
+  Make task. Cleaning runs `make clean`.
+- CMake configures `build-<name>` unless `build_directory` is provided. Use
+  `buildtype` for the CMake configuration and `build_target` for an optional
+  target name. Supply `binary` explicitly for running/debugging.
+- Meson configures `build-<name>` and discovers a default executable when `binary`
+  is unset. Compilation and cleaning use `meson compile`, so the backend is not
+  tied to invoking Ninja directly.
+- Gradle detects the platform's wrapper and uses the target name as the task.
+- Shell detects `build.sh` or uses explicit `command` and `arguments` fields.
+- Internal discovers C/C++ files beneath `src`/`srcs`. It accepts `cc`, `cxx`,
+  `ar`, `ld`, `cflags`, `cxxflags`, `ldflags`, `obj`, `ignored_files` and `files`.
+  `files` maps source paths to per-file overrides and may include files outside
+  `srcs`. Its `type` is `executable` (default), `static` or `shared`; shared builds
+  should supply the compiler's required position-independent code flags.
 
-The `make` backend engages with `Makefile`s. If a `Makefile` exists, by default, the backend will infer the "all" target, which will simply call `make` with no arguments.
-
-#### shell
-
-The `shell` backend engages with a file called `build.sh`. If a `build.sh` file exists, by default the backend will infer a `debug` target, which will call the `build.sh` file with `-g`, and a `release` target, which will call the `build.sh` file with no arguments.
-
-#### meson
-
-The `meson` backend engages with a `meson.build` file. If a `meson.build` file exists, by default will infer a `debug` target, which if the directory `build-debug` doesn't exist will create it, and call `meson setup build-debug`. It will then call `ninja -C build-debug`.
-
-#### internal
-
-If no other backend has engaged, internal will look for a `src` folder. If it finds it, it will automatically compile every `*.c` or `*.cpp` file in there with standard build parameters. 
-You can specify also the following types of flags in the target:
-
-* `cflags` - Compile flags to pass while compinling object files for \*.c files.
-* `cxxflags` - Compile flags to pass while compiling object files for \*.cpp files.
-* `ldflags` - Linking flags to pass while linking together your object files.
-* `type` - The type of output to produce. Possible values are `static`, `shared` and `executable`. Default is `executable`.
-* `binary` - The resulting target name for the binary.
-
-
-### Example Config
-
-When setting up a project, you had a makefile driven project, you could place the following in your project module to get 5 targets, 3 of which are executable:
-
-```lua
-config.plugins.build.targets = {
-  { name = "TestSanity", binary = "bin/01sanity" },
-	{ name = "LibraryDebug" },
-	{ name = "LibraryRelease" },
-	{ name = "WebserverDebug", binary = "bin/searchserver" },
-	{ name = "WebserverRelease", binary = "bin/searchserver" }
-}
-config.plugins.build.type = "make"
-```
-
-
+See the repository README for example target configurations.
